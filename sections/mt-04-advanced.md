@@ -5,6 +5,20 @@
 
 A **deadlock** is a situation where two or more threads are **permanently blocked**, each waiting for a lock held by the other.
 
+### Why Deadlocks Are Critical
+- The application **hangs silently** — no exception is thrown, no error logged
+- Affects only the deadlocked threads initially, but cascades as other threads wait for the same locks
+- In production, deadlocks often appear only under **high load** (when thread timing changes)
+- They are **permanent** — the application will never recover without intervention
+
+### Real-World Production Scenarios
+| Scenario | What Happens |
+|---|---|
+| Money transfer between two accounts | Thread A locks Account-1, Thread B locks Account-2, both wait for the other |
+| Distributed lock across microservices | Service A holds Lock-X, Service B holds Lock-Y, circular dependency |
+| Database row-level locks | Transaction 1 locks Row A, Transaction 2 locks Row B, both try to update the other |
+| Spring bean circular dependency | BeanA depends on BeanB, BeanB depends on BeanA during initialization |
+
 ```
 Thread A holds Lock-1, waiting for Lock-2
 Thread B holds Lock-2, waiting for Lock-1
@@ -167,9 +181,35 @@ public void transfer(Account from, Account to, double amount) {
 
 # Chapter 14: Thread Safety Design Patterns
 
+### Why Thread Safety Patterns Matter
+There are exactly **three strategies** to achieve thread safety. Every pattern falls into one of these categories:
+
+| Strategy | How It Works | Example Patterns |
+|---|---|---|
+| **Don't share state** | Each thread has its own data | ThreadLocal, immutable value objects |
+| **Share immutable state** | Data cannot change after creation | Immutable objects, final fields |
+| **Synchronize access** | Only one thread accesses at a time | synchronized, locks, atomic variables |
+
+> **Architect's Principle:** Always prefer immutability and no-sharing over synchronization. Synchronization is the most error-prone approach.
+
 ## 14.1 Immutable Objects
 
+### What are Immutable Objects?
 Objects whose state **cannot change after construction**. Inherently thread-safe — no synchronization needed.
+
+### Why Use Immutable Objects for Thread Safety
+- **Zero synchronization overhead** — no locks, no volatile, no atomic operations
+- **No race conditions possible** — if the data cannot change, concurrent reads are always safe
+- **Safe to share freely** — pass between threads, store in caches, return from methods
+- **Easier to reason about** — the object you have will never change unexpectedly
+
+### When to Use
+- Configuration objects, DTOs, value objects, keys in maps
+- Any object shared across threads where mutation is not needed
+
+### When NOT to Use
+- Objects that MUST be updated frequently (use AtomicReference or synchronized instead)
+- Very large objects where copying is expensive
 
 ```java
 public final class ImmutableConfig {
@@ -200,7 +240,23 @@ public final class ImmutableConfig {
 
 ## 14.2 ThreadLocal
 
+### What is ThreadLocal?
 Each thread gets its **own copy** of a variable. No sharing → no synchronization needed.
+
+### Why ThreadLocal Exists
+Sometimes you need per-request data (current user, transaction ID, locale) that flows through many method calls. Passing it as a parameter to every method is impractical. ThreadLocal makes it **implicitly available** to any code running on the same thread.
+
+### When to Use
+- Per-request context in web applications (user identity, correlation ID)
+- Database connections (connection-per-thread pattern)
+- `SimpleDateFormat` instances (not thread-safe, ThreadLocal fixes it)
+
+### When NOT to Use
+- **With thread pools** — ThreadLocal values leak between requests unless explicitly cleaned up
+- **With async/reactive code** — tasks may switch threads mid-execution
+- **For sharing data between threads** — ThreadLocal is per-thread, not shared
+
+> **Production Warning:** ALWAYS call `ThreadLocal.remove()` in a `finally` block or interceptor. In thread pools, a thread is reused for the next request — if you don't clean up, the next request sees the previous request's data. This is a **security vulnerability**.
 
 ```java
 public class RequestContext {
@@ -710,5 +766,151 @@ CompletableFuture.supplyAsync(() -> {
     return restTemplate.getForObject(url, Data.class);
 }, ioExecutor); // IO pool designed for blocking calls
 ```
+
+---
+
+# Chapter 18: Build It Yourself — Async Order Processing System
+
+> **Goal:** Build a Spring Boot application that processes orders asynchronously using ThreadPool, CompletableFuture, BlockingQueue, and @Async.
+
+## Concept Overview
+
+| Component | Threading Pattern | Why |
+|---|---|---|
+| Order submission | `@Async` | Non-blocking — API returns immediately |
+| Parallel API calls | `CompletableFuture.allOf()` | Call payment + inventory simultaneously |
+| Background queue | `BlockingQueue` + workers | Producer-consumer decoupling |
+| Thread pool | `ThreadPoolTaskExecutor` | Bounded pool prevents exhaustion |
+
+---
+
+## Step 1: Configure Thread Pool
+
+**Concept:** Always use bounded pools in production. Never create raw threads.
+
+```java
+@Configuration
+@EnableAsync
+public class AsyncConfig implements AsyncConfigurer {
+
+    @Override
+    @Bean("orderPool")
+    public Executor getAsyncExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(5);               // 5 threads always alive
+        executor.setMaxPoolSize(20);               // Scale to 20 under load
+        executor.setQueueCapacity(100);            // Max 100 waiting tasks
+        executor.setThreadNamePrefix("order-");    // Named for debugging
+        executor.setRejectedExecutionHandler(
+            new ThreadPoolExecutor.CallerRunsPolicy());  // Backpressure
+        executor.initialize();
+        return executor;
+    }
+}
+```
+
+**Key Takeaways:**
+- `corePoolSize` = threads always alive (even idle)
+- `queueCapacity` = MUST be bounded (prevent OOM)
+- `CallerRunsPolicy` = slows producer when overwhelmed
+
+---
+
+## Step 2: Build Async Order Service
+
+**Concept:** `@Async` runs method in background thread. `CompletableFuture.allOf()` runs multiple calls in parallel.
+
+```java
+@Service
+@RequiredArgsConstructor
+public class OrderService {
+
+    private final PaymentClient paymentClient;
+    private final InventoryClient inventoryClient;
+
+    @Async("orderPool")
+    public CompletableFuture<OrderResult> processOrderAsync(OrderRequest request) {
+        log.info("Processing on thread: {}", Thread.currentThread().getName());
+
+        // PARALLEL calls — 200ms total instead of 400ms sequential
+        CompletableFuture<PaymentResult> payment = CompletableFuture
+            .supplyAsync(() -> paymentClient.charge(request.getPayment()));
+        CompletableFuture<InventoryResult> inventory = CompletableFuture
+            .supplyAsync(() -> inventoryClient.reserve(request.getItems()));
+
+        CompletableFuture.allOf(payment, inventory).join();
+
+        return CompletableFuture.completedFuture(
+            new OrderResult(payment.join().getTxnId(), inventory.join().getReservationId()));
+    }
+}
+```
+
+---
+
+## Step 3: Create Producer-Consumer Queue
+
+**Concept:** BlockingQueue decouples submission from processing. Producers add, consumers process independently.
+
+```java
+@Service
+public class OrderQueueService {
+
+    private final BlockingQueue<OrderRequest> queue =
+        new LinkedBlockingQueue<>(10_000);          // Bounded queue
+
+    public boolean submit(OrderRequest order) {
+        return queue.offer(order);                  // Non-blocking, returns false if full
+    }
+
+    @PostConstruct
+    public void startConsumers() {
+        for (int i = 0; i < 5; i++) {
+            Thread worker = new Thread(() -> {
+                while (!Thread.currentThread().isInterrupted()) {
+                    try {
+                        OrderRequest order = queue.take();   // Blocks until available
+                        processOrder(order);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }, "order-worker-" + i);
+            worker.setDaemon(true);
+            worker.start();
+        }
+    }
+}
+```
+
+---
+
+## Step 4: REST Controller
+
+```java
+@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+
+    @Autowired private OrderService orderService;
+
+    @PostMapping
+    public ResponseEntity<String> submitOrder(@RequestBody OrderRequest request) {
+        orderService.processOrderAsync(request);    // Returns immediately
+        return ResponseEntity.accepted().body("Order submitted");
+    }
+}
+```
+
+---
+
+## Key Takeaways
+
+| Pattern | Use When | Avoid When |
+|---|---|---|
+| `@Async` | Fire-and-forget (emails, logs) | Need result immediately |
+| `CompletableFuture.allOf()` | Parallel independent calls | Sequential dependencies |
+| `BlockingQueue` + consumers | High-throughput processing | Simple one-off tasks |
+| `ThreadPoolTaskExecutor` | Always in production | Never create raw threads |
 
 ---

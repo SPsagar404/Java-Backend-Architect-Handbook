@@ -591,3 +591,240 @@ server:
 ```
 
 ---
+
+# Part 16: Build It Yourself — JWT Authentication System
+
+> **Goal:** Build a complete Spring Security JWT authentication system from scratch — registration, login, token issuance, and role-based access control.
+
+## Concept Overview
+
+```
+Registration:  POST /api/auth/register → Save user (BCrypt password) → Return success
+Login:         POST /api/auth/login    → Validate credentials → Return JWT
+API Call:      GET /api/users/me       → JWT in header → JwtFilter validates → Return data
+```
+
+| Component | Purpose |
+|---|---|
+| `SecurityConfig` | Defines which URLs need auth, which are public |
+| `JwtService` | Creates and validates JWT tokens |
+| `JwtAuthenticationFilter` | Intercepts every request, extracts and validates JWT |
+| `CustomUserDetailsService` | Loads user from database for Spring Security |
+| `AuthController` | Login and register endpoints |
+
+---
+
+## Step 1: Add Dependencies
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-api</artifactId>
+    <version>0.12.5</version>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-impl</artifactId>
+    <version>0.12.5</version>
+    <scope>runtime</scope>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-jackson</artifactId>
+    <version>0.12.5</version>
+    <scope>runtime</scope>
+</dependency>
+```
+
+---
+
+## Step 2: Create JwtService
+
+**Concept:** JWT = Header.Payload.Signature. The server signs the token with a secret key. On each request, it validates the signature — no database lookup needed.
+
+```java
+@Service
+public class JwtService {
+
+    @Value("${jwt.secret}")
+    private String secretKey;
+
+    public String generateToken(UserDetails user) {
+        return Jwts.builder()
+            .subject(user.getUsername())
+            .claim("roles", user.getAuthorities().stream()
+                .map(GrantedAuthority::getAuthority).toList())
+            .issuedAt(new Date())
+            .expiration(new Date(System.currentTimeMillis() + 900_000))  // 15 min
+            .signWith(getSigningKey())
+            .compact();
+    }
+
+    public String extractUsername(String token) {
+        return getClaims(token).getSubject();
+    }
+
+    public boolean isTokenValid(String token, UserDetails user) {
+        return extractUsername(token).equals(user.getUsername())
+            && !getClaims(token).getExpiration().before(new Date());
+    }
+
+    private Claims getClaims(String token) {
+        return Jwts.parser().verifyWith(getSigningKey())
+            .build().parseSignedClaims(token).getPayload();
+    }
+
+    private SecretKey getSigningKey() {
+        return Keys.hmacShaKeyFor(Decoders.BASE64.decode(secretKey));
+    }
+}
+```
+
+---
+
+## Step 3: Create JWT Authentication Filter
+
+**Concept:** This filter runs BEFORE every request. It extracts the JWT from the `Authorization` header, validates it, and sets the authenticated user in Spring's SecurityContext.
+
+```java
+@Component
+@RequiredArgsConstructor
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+
+    private final JwtService jwtService;
+    private final CustomUserDetailsService userDetailsService;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+            HttpServletResponse response, FilterChain chain)
+            throws ServletException, IOException {
+
+        String authHeader = request.getHeader("Authorization");
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            chain.doFilter(request, response);       // No token → continue (might be public URL)
+            return;
+        }
+
+        String token = authHeader.substring(7);
+        String username = jwtService.extractUsername(token);
+
+        if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+            UserDetails user = userDetailsService.loadUserByUsername(username);
+            if (jwtService.isTokenValid(token, user)) {
+                UsernamePasswordAuthenticationToken auth =
+                    new UsernamePasswordAuthenticationToken(user, null, user.getAuthorities());
+                SecurityContextHolder.getContext().setAuthentication(auth);
+            }
+        }
+        chain.doFilter(request, response);
+    }
+}
+```
+
+---
+
+## Step 4: Configure Security
+
+```java
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Autowired private JwtAuthenticationFilter jwtFilter;
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        return http
+            .csrf(csrf -> csrf.disable())              // Disable CSRF for REST APIs
+            .sessionManagement(s -> s
+                .sessionCreationPolicy(SessionCreationPolicy.STATELESS))  // No sessions
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/auth/**").permitAll()   // Public: login, register
+                .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                .anyRequest().authenticated())
+            .addFilterBefore(jwtFilter,                // Add JWT filter to chain
+                UsernamePasswordAuthenticationFilter.class)
+            .build();
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder(12);          // BCrypt with strength 12
+    }
+}
+```
+
+---
+
+## Step 5: Create Auth Controller
+
+```java
+@RestController
+@RequestMapping("/api/auth")
+@RequiredArgsConstructor
+public class AuthController {
+
+    private final AuthenticationManager authManager;
+    private final JwtService jwtService;
+    private final UserRepository userRepository;
+    private final PasswordEncoder passwordEncoder;
+
+    @PostMapping("/register")
+    public ResponseEntity<String> register(@RequestBody RegisterRequest req) {
+        User user = new User();
+        user.setEmail(req.email());
+        user.setPasswordHash(passwordEncoder.encode(req.password()));
+        user.setRole(Role.USER);
+        userRepository.save(user);
+        return ResponseEntity.status(201).body("User registered");
+    }
+
+    @PostMapping("/login")
+    public ResponseEntity<AuthResponse> login(@RequestBody LoginRequest req) {
+        authManager.authenticate(
+            new UsernamePasswordAuthenticationToken(req.email(), req.password()));
+        UserDetails user = userDetailsService.loadUserByUsername(req.email());
+        String token = jwtService.generateToken(user);
+        return ResponseEntity.ok(new AuthResponse(token));
+    }
+}
+```
+
+---
+
+## Step 6: Test the Flow
+
+```bash
+# Register
+curl -X POST http://localhost:8080/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"user@test.com","password":"secret123"}'
+
+# Login (get JWT)
+curl -X POST http://localhost:8080/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"user@test.com","password":"secret123"}'
+# Response: {"token":"eyJhbGciOiJIUzI1NiIs..."}
+
+# Access protected endpoint
+curl http://localhost:8080/api/users/me \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..."
+```
+
+---
+
+## Key Takeaways
+
+| Concept | Remember |
+|---|---|
+| JWT is stateless | Server doesn't store sessions — token contains all user info |
+| BCrypt for passwords | Never store plain text; use strength 10-12 |
+| Filter chain order | JwtFilter BEFORE UsernamePasswordAuthenticationFilter |
+| `@PreAuthorize` | Method-level security: `@PreAuthorize("hasRole('ADMIN')")` |
+| Token expiry | Access = 15 min, Refresh = 7 days, always short-lived |
+
+---

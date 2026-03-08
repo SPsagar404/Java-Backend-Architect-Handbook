@@ -5,6 +5,25 @@
 
 A pattern where services communicate by producing and consuming **events** rather than making direct calls. An event represents something that happened: "Order was created", "Payment was processed", "Inventory was updated".
 
+### Why Event-Driven Over REST Calls
+| REST (Synchronous) | Event-Driven (Asynchronous) |
+|---|---|
+| Order Service CALLS Inventory directly | Order Service PUBLISHES event, doesn't know consumers |
+| If Inventory is down, Order fails | Order succeeds immediately, Inventory processes later |
+| Adding a new consumer requires changing Order Service | New consumers subscribe without any changes |
+| Tight coupling between services | Loose coupling — services don't know about each other |
+
+### When to Use Event-Driven Architecture
+- **Multiple services** need to react to the same business event
+- Services can tolerate **eventual consistency** (not instant)
+- You need **audit trail** of all events (event log)
+- System needs to handle **traffic spikes** (events buffered in queue)
+
+### When NOT to Use
+- Simple CRUD applications with 2-3 services
+- When you need **immediate consistency** across services
+- When the added complexity of Kafka/RabbitMQ is not justified
+
 ```
 +----------+                            +----------+
 | Order    |  --OrderCreatedEvent-->    | Inventory|
@@ -148,6 +167,17 @@ Step 6: Notification Service consumes all events
 
 # Part 9: Distributed Data Management
 
+### Why Distributed Data is Hard
+In a monolith, all data lives in one database — you can use JOINs, foreign keys, and multi-table transactions. In microservices, each service has its own database. This creates three fundamental challenges:
+
+| Challenge | Monolith Solution | Microservices Solution |
+|---|---|---|
+| Cross-service queries | SQL JOIN | API calls + data denormalization |
+| Multi-service transactions | Single DB transaction | Saga pattern |
+| Data consistency | ACID guarantees | Eventual consistency + event sourcing |
+
+> **CAP Theorem Reminder:** In a distributed system, you can only guarantee 2 of 3: Consistency, Availability, Partition Tolerance. Most microservices choose AP (Available + Partition Tolerant) and accept eventual consistency.
+
 ## 9.1 Database Per Service Pattern
 
 Each microservice owns its data and exposes it only through its API. No direct cross-service database access.
@@ -181,7 +211,24 @@ Without shared DB, you can't use JOINs or foreign keys across services. Data may
 
 ## 9.3 Saga Pattern
 
+### What is the Saga Pattern?
 A sequence of local transactions where each service publishes events to trigger the next step. If one step fails, compensating transactions undo previous steps.
+
+### Why Sagas Over Distributed Transactions (2PC)
+| Two-Phase Commit (2PC) | Saga Pattern |
+|---|---|
+| Locks resources across services | No distributed locks |
+| Single coordinator failure = system freeze | Each service acts independently |
+| Not scalable | Scales with number of services |
+| Tight coupling | Loose coupling |
+
+### Two Approaches
+| Choreography | Orchestration |
+|---|---|
+| Services react to events independently | Central coordinator directs each step |
+| No single point of failure | Easier to understand and debug |
+| Harder to track overall progress | Coordinator can track saga state |
+| Best for simple sagas (3-4 steps) | Best for complex sagas (5+ steps) |
 
 ### Choreography-Based Saga
 ```
@@ -267,7 +314,18 @@ public class OrderSagaOrchestrator {
 
 ## 9.4 CQRS (Command Query Responsibility Segregation)
 
-Separate the write model (commands) from the read model (queries).
+### What is CQRS?
+Separate the write model (commands) from the read model (queries). Use different data stores, schemas, and even programming models for reads and writes.
+
+### Why CQRS?
+- **Reads and writes have different performance requirements** — reads need fast denormalized data, writes need normalized integrity
+- **Read-heavy systems** (100 reads per write) benefit from optimized read stores
+- **Complex queries** can use search indexes (Elasticsearch) while writes use relational DB
+
+### When NOT to Use CQRS
+- Simple CRUD applications — the complexity is not justified
+- When strong consistency is required (CQRS introduces eventual consistency)
+- Small datasets where a single database handles both read/write efficiently
 
 ```
 Commands (Write):                    Queries (Read):
@@ -308,6 +366,25 @@ Benefits:
 ---
 
 # Part 10: Caching Architecture
+
+### What is Caching in Microservices?
+Caching stores frequently accessed data in fast storage (Redis, in-memory) to reduce database load and improve response times.
+
+### Why Caching is Critical
+In a microservices architecture, a single user request may trigger 3-5 inter-service calls. Without caching, each call hits its database, creating a cascade of queries. Caching can reduce response time from **200ms to 2ms**.
+
+### Cache Strategy Decision Guide
+| Strategy | How It Works | Use When |
+|---|---|---|
+| **Cache-Aside** | App checks cache, on miss loads from DB and writes to cache | Read-heavy, tolerates stale data |
+| **Write-Through** | App writes to cache AND DB simultaneously | Need immediate cache consistency |
+| **Write-Behind** | App writes to cache, async writes to DB | Write-heavy, tolerates data loss risk |
+| **Read-Through** | Cache itself loads data from DB on miss | Simplified app logic |
+
+### When NOT to Use Caching
+- **Frequently changing data** — cache becomes stale immediately
+- **Unique queries** — every query is different, cache hit rate is near 0%
+- When **data consistency** is critical (financial balances)
 
 ## 10.1 Why Caching in Microservices?
 
@@ -452,6 +529,18 @@ public class ProductService {
 
 # Part 11: Microservices Design Patterns
 
+### Overview of Key Patterns
+Microservices patterns solve recurring problems in distributed systems. Understanding WHEN to use each pattern is as important as understanding HOW it works.
+
+| Pattern | Problem It Solves |
+|---|---|
+| **API Gateway** | Single entry point for all clients |
+| **Circuit Breaker** | Prevent cascade failures when a service is down |
+| **Bulkhead** | Isolate failures so one slow service doesn't kill all |
+| **Saga** | Distributed transactions across services |
+| **Strangler Fig** | Gradual migration from monolith to microservices |
+| **Sidecar** | Cross-cutting concerns (logging, mTLS) without code changes |
+
 ## 11.1 API Gateway Pattern
 
 Already covered in Part 5. Single entry point for all clients, handles routing, auth, rate limiting.
@@ -556,6 +645,20 @@ Sidecar handles:
 ---
 
 # Part 12: Resilience and Fault Tolerance
+
+### Why Resilience Matters in Microservices
+In a monolith, failures are typically all-or-nothing. In microservices, **partial failures** are common — one service may be down while others work fine. Resilience patterns ensure the entire system doesn't collapse when one service fails.
+
+### The Four Pillars of Resilience
+| Pattern | What It Does | Real-World Analogy |
+|---|---|---|
+| **Circuit Breaker** | Stops calling a failing service | Electrical circuit breaker |
+| **Retry** | Automatically retries failed calls | Redial a phone call |
+| **Rate Limiter** | Limits how many calls per second | Traffic speed limit |
+| **Timeout** | Sets maximum wait time for a response | Restaurant wait time limit |
+
+### Resilience4j — The Standard Library
+Resilience4j is the recommended library for resilience in Spring Boot 3+. It replaces Netflix Hystrix (which is deprecated).
 
 ## 12.1 Resilience4j Circuit Breaker
 

@@ -432,3 +432,170 @@ infrastructure/
 ```
 
 ---
+
+# Part 18: Build It Yourself — Order Processing Microservices
+
+> **Goal:** Build a minimal microservices system with 3 services (Order, Payment, Notification) + API Gateway + Service Discovery — step by step.
+
+## Concept Overview
+
+```
+Client → API Gateway → Order Service → Payment Service (REST)
+                                     → Kafka → Notification Service (consumer)
+                   ↑
+              Eureka (Service Discovery)
+```
+
+| Service | Role | Port |
+|---|---|---|
+| Eureka Server | Service registry | 8761 |
+| API Gateway | Routes, JWT validation | 8080 |
+| Order Service | Order CRUD, orchestrates payment | 8081 |
+| Payment Service | Payment processing | 8082 |
+| Notification Service | Sends emails (Kafka consumer) | 8083 |
+
+---
+
+## Step 1: Create Eureka Server (Service Discovery)
+
+**Concept:** Eureka Server is a registry where services register themselves. Other services can discover and call them by name instead of hardcoded URLs.
+
+```java
+@SpringBootApplication
+@EnableEurekaServer                          // Activates Eureka Server
+public class EurekaServerApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(EurekaServerApplication.class, args);
+    }
+}
+```
+```yaml
+# application.yml
+server:
+  port: 8761
+eureka:
+  client:
+    register-with-eureka: false             # Don't register itself
+    fetch-registry: false
+```
+
+---
+
+## Step 2: Create API Gateway
+
+**Concept:** API Gateway is the single entry point. It routes requests to services by name (resolved via Eureka).
+
+```yaml
+server:
+  port: 8080
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: order-service
+          uri: lb://ORDER-SERVICE             # lb:// = load-balanced via Eureka
+          predicates:
+            - Path=/api/orders/**
+        - id: payment-service
+          uri: lb://PAYMENT-SERVICE
+          predicates:
+            - Path=/api/payments/**
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka
+```
+
+---
+
+## Step 3: Create Order Service
+
+**Concept:** Order Service handles order CRUD and calls Payment Service via Feign Client (service-to-service REST call).
+
+```java
+// Feign Client — calls Payment Service by name (resolved via Eureka)
+@FeignClient(name = "PAYMENT-SERVICE")
+public interface PaymentClient {
+    @PostMapping("/api/payments")
+    PaymentResponse processPayment(@RequestBody PaymentRequest request);
+}
+
+// Service
+@Service
+@RequiredArgsConstructor
+public class OrderService {
+    private final OrderRepository orderRepository;
+    private final PaymentClient paymentClient;       // Feign auto-proxy
+    private final KafkaTemplate<String, OrderEvent> kafkaTemplate;
+
+    @Transactional
+    public OrderDTO createOrder(OrderRequest request) {
+        Order order = orderRepository.save(new Order(request, OrderStatus.PENDING));
+
+        // Call Payment Service via Feign
+        PaymentResponse payment = paymentClient.processPayment(
+            new PaymentRequest(order.getId(), order.getTotalAmount()));
+
+        order.setStatus(payment.isSuccess() ? OrderStatus.CONFIRMED : OrderStatus.FAILED);
+
+        // Publish event to Kafka for Notification Service
+        kafkaTemplate.send("order-events",
+            new OrderEvent(order.getId(), order.getStatus(), request.getEmail()));
+
+        return OrderDTO.from(order);
+    }
+}
+```
+
+---
+
+## Step 4: Create Notification Service (Kafka Consumer)
+
+**Concept:** This service has NO REST APIs. It only listens to Kafka events and sends notifications.
+
+```java
+@Service
+public class NotificationConsumer {
+
+    @KafkaListener(topics = "order-events", groupId = "notification-group")
+    public void handleOrderEvent(OrderEvent event) {
+        if (event.getStatus() == OrderStatus.CONFIRMED) {
+            emailService.sendOrderConfirmation(event.getEmail(), event.getOrderId());
+        }
+        log.info("Notification sent for order: {}", event.getOrderId());
+    }
+}
+```
+
+---
+
+## Step 5: Run Everything
+
+```bash
+# Start in order:
+1. Eureka Server    → mvn spring-boot:run (port 8761)
+2. Kafka            → docker-compose up kafka zookeeper
+3. Order Service    → mvn spring-boot:run (port 8081)
+4. Payment Service  → mvn spring-boot:run (port 8082)
+5. Notification Svc → mvn spring-boot:run (port 8083)
+6. API Gateway      → mvn spring-boot:run (port 8080)
+
+# Test via Gateway:
+curl -X POST http://localhost:8080/api/orders \
+  -H "Content-Type: application/json" \
+  -d '{"items": [{"productId": 1, "qty": 2}], "email": "user@test.com"}'
+```
+
+---
+
+## Key Takeaways
+
+| Pattern | What It Solves |
+|---|---|
+| Eureka | Services discover each other by name, no hardcoded URLs |
+| API Gateway | Single entry point, routing, cross-cutting concerns |
+| Feign Client | Type-safe REST client for service-to-service calls |
+| Kafka | Async event-driven communication (decoupled services) |
+| Each service has its own DB | Data isolation, independent deployment |
+
+---

@@ -603,3 +603,161 @@ public void handleOrderCreated(OrderCreatedEvent event) {
 ```
 
 ---
+
+# Part 22: Build It Yourself — User Management with JPA
+
+> **Goal:** Build a Spring Boot User Management REST API using Hibernate/JPA, covering entities, repositories, service layer, and performance optimization.
+
+## Concept Overview
+
+| Layer | Technology | Purpose |
+|---|---|---|
+| Entity | `@Entity`, `@Table`, `@ManyToOne` | Maps Java objects to database tables |
+| Repository | `JpaRepository`, `@Query` | Data access without writing SQL |
+| Service | `@Transactional`, dirty checking | Business logic with automatic transaction management |
+| DTO | Record classes | Decouple API from internal entities |
+
+---
+
+## Step 1: Define Entities with Relationships
+
+**Concept:** Each `@Entity` class maps to a database table. Relationships use `@ManyToOne` (owning side with FK) and `@OneToMany` (inverse side).
+
+```java
+@Entity
+@Table(name = "users",
+    indexes = @Index(name = "idx_user_email", columnList = "email"))
+@Data @NoArgsConstructor @AllArgsConstructor @Builder
+public class User {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, length = 100)
+    private String firstName;
+
+    @Column(nullable = false, unique = true)
+    private String email;
+
+    @Enumerated(EnumType.STRING)
+    private UserStatus status = UserStatus.ACTIVE;
+
+    @Embedded                                  // Value object stored in same table
+    private Address address;
+
+    @OneToMany(mappedBy = "user",              // Inverse side — no FK here
+               cascade = CascadeType.ALL,
+               orphanRemoval = true)
+    private List<Order> orders = new ArrayList<>();
+
+    @Column(updatable = false)
+    private LocalDateTime createdAt;
+
+    @PrePersist
+    void onCreate() { createdAt = LocalDateTime.now(); }
+
+    // Helper method for bidirectional consistency
+    public void addOrder(Order order) {
+        orders.add(order);
+        order.setUser(this);
+    }
+}
+```
+
+---
+
+## Step 2: Create the Repository
+
+**Concept:** `JpaRepository` gives you CRUD + paging for free. Custom queries use `@Query` (JPQL) or derived method names.
+
+```java
+public interface UserRepository extends JpaRepository<User, Long> {
+
+    Optional<User> findByEmail(String email);          // Derived query — Spring generates SQL
+
+    boolean existsByEmail(String email);               // EXISTS query — efficient
+
+    @Query("SELECT u FROM User u WHERE u.status = :status")
+    Page<User> findByStatus(@Param("status") UserStatus status, Pageable pageable);
+
+    @EntityGraph(attributePaths = {"orders"})           // Fetch orders eagerly (avoids N+1)
+    Optional<User> findWithOrdersById(Long id);
+
+    @Modifying @Transactional
+    @Query("UPDATE User u SET u.status = 'INACTIVE' WHERE u.createdAt < :cutoff")
+    int deactivateOldUsers(@Param("cutoff") LocalDateTime cutoff);
+}
+```
+
+---
+
+## Step 3: Build the Service Layer
+
+**Concept:** `@Transactional` manages database transactions. Dirty checking automatically saves changes to persistent entities — no explicit `save()` needed for updates.
+
+```java
+@Service
+@RequiredArgsConstructor
+public class UserService {
+
+    private final UserRepository userRepository;
+
+    @Transactional
+    public UserDTO createUser(CreateUserRequest req) {
+        if (userRepository.existsByEmail(req.email())) {
+            throw new DuplicateEmailException(req.email());
+        }
+        User user = User.builder()
+            .firstName(req.firstName())
+            .email(req.email())
+            .build();
+        return UserDTO.from(userRepository.save(user));
+    }
+
+    @Transactional(readOnly = true)       // Read-only = no dirty checking overhead
+    public Page<UserDTO> listUsers(int page, int size) {
+        return userRepository.findAll(PageRequest.of(page, size))
+            .map(UserDTO::from);
+    }
+
+    @Transactional
+    public UserDTO updateUser(Long id, UpdateUserRequest req) {
+        User user = userRepository.findById(id)
+            .orElseThrow(() -> new UserNotFoundException(id));
+        user.setFirstName(req.firstName());
+        // NO save() needed — dirty checking auto-persists on commit
+        return UserDTO.from(user);
+    }
+}
+```
+
+---
+
+## Step 4: Performance Optimization
+
+```yaml
+spring:
+  jpa:
+    properties:
+      hibernate:
+        default_batch_fetch_size: 25     # Batch-fetch lazy collections
+        jdbc:
+          batch_size: 50                  # Batch INSERTs/UPDATEs
+        order_inserts: true               # Group INSERTs by entity type
+        order_updates: true
+    show-sql: true                        # See generated SQL
+```
+
+---
+
+## Key Takeaways
+
+| Concept | Remember |
+|---|---|
+| `@ManyToOne(fetch = LAZY)` | Always set LAZY — override EAGER defaults |
+| `mappedBy` | Inverse side has NO FK column — it's a mirror |
+| Dirty checking | Persistent entities auto-save on transaction commit |
+| `@EntityGraph` | Solve N+1 by fetching associations in a single query |
+| `@Transactional(readOnly = true)` | Better performance for read operations |
+| DTO projections | Don't expose entities directly — use DTOs |
+
+---

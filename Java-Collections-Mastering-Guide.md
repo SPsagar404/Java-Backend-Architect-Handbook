@@ -3249,6 +3249,313 @@ public abstract class AbstractList<E> extends AbstractCollection<E> {
 
 ---
 
+# Chapter 14: Build It Yourself -- Product Inventory Manager
+
+> **Goal:** Build a complete Spring Boot Product Inventory Manager that demonstrates all major collection types in a real application.
+
+## Concept Overview
+
+Before writing code, understand what we are building and why each collection type matters:
+
+| Component | Collection Used | Why This Collection |
+|---|---|---|
+| Product catalog | `ArrayList<Product>` | Ordered list with fast random access for browsing |
+| Unique categories | `HashSet<String>` | Automatically prevents duplicate category names |
+| Product lookup cache | `HashMap<String, Product>` | O(1) lookup by product SKU -- instant cache retrieval |
+| Price-sorted products | `TreeMap<BigDecimal, List<Product>>` | Automatically sorted by price for range queries |
+| Processing queue | `PriorityQueue<RestockRequest>` | Processes urgent restocks first based on priority |
+| LRU cache | `LinkedHashMap` | Access-order tracking for evicting least-recently-used items |
+
+---
+
+## Step 1: Create the Spring Boot Project
+
+**Concept:** Spring Initializr generates a Maven/Gradle project with all necessary dependencies pre-configured.
+
+```bash
+# Using Spring Initializr CLI or https://start.spring.io
+# Dependencies: Spring Web, Spring Data JPA, H2 Database, Lombok
+```
+
+**What each dependency does:**
+- `Spring Web` -> REST controllers (`@RestController`, `@GetMapping`)
+- `Spring Data JPA` -> Database access via repositories
+- `H2` -> In-memory database for development (no setup needed)
+- `Lombok` -> Reduces boilerplate (`@Data`, `@Builder`, `@AllArgsConstructor`)
+
+---
+
+## Step 2: Define the Product Entity
+
+**Concept:** An entity is a Java class that maps to a database table. Each field maps to a column.
+
+```java
+// src/main/java/com/app/entity/Product.java
+@Entity                                    // Marks this class as a JPA entity (database table)
+@Table(name = "products")                  // Maps to "products" table
+@Data                                      // Lombok: generates getters, setters, toString, equals, hashCode
+@NoArgsConstructor                         // JPA requires a no-arg constructor
+@AllArgsConstructor
+@Builder
+public class Product implements Comparable<Product> {
+
+    @Id                                    // Primary key
+    @GeneratedValue(strategy = GenerationType.IDENTITY)  // Auto-increment
+    private Long id;
+
+    @Column(nullable = false, unique = true)  // SKU must be unique, not null
+    private String sku;
+
+    @Column(nullable = false)
+    private String name;
+
+    private String category;
+
+    @Column(precision = 10, scale = 2)     // Decimal with 2 decimal places
+    private BigDecimal price;
+
+    private int stockQuantity;
+
+    @Column(updatable = false)
+    private LocalDateTime createdAt;
+
+    @PrePersist                            // Called automatically before INSERT
+    protected void onCreate() {
+        createdAt = LocalDateTime.now();
+    }
+
+    @Override
+    public int compareTo(Product other) {  // Natural ordering by name (for TreeSet/TreeMap)
+        return this.name.compareTo(other.name);
+    }
+}
+```
+
+**Key Takeaways:**
+- `@Entity` + `@Table` -> maps Java class to database table
+- `@Id` + `@GeneratedValue` -> auto-generated primary key
+- `@PrePersist` -> lifecycle callback, runs before save
+- `Comparable<Product>` -> enables natural ordering in sorted collections
+
+---
+
+## Step 3: Build the Inventory Service (Using ALL Collection Types)
+
+**Concept:** The service layer contains business logic. Here we use different collections for different data access patterns.
+
+```java
+// src/main/java/com/app/service/InventoryService.java
+@Service
+public class InventoryService {
+
+    // --- Collection 1: ArrayList ---
+    // WHY ArrayList: We need an ordered list for product catalog browsing.
+    // ArrayList gives O(1) random access, ideal for paginated API responses.
+    private final List<Product> catalogCache = new ArrayList<>();
+
+    // --- Collection 2: HashSet ---
+    // WHY HashSet: Categories must be unique. HashSet automatically rejects
+    // duplicates and provides O(1) lookup for "does this category exist?"
+    private final Set<String> categories = new HashSet<>();
+
+    // --- Collection 3: HashMap ---
+    // WHY HashMap: We need instant O(1) product lookup by SKU.
+    // This is our in-memory cache -- avoids hitting the database for every request.
+    private final Map<String, Product> skuCache = new ConcurrentHashMap<>();
+
+    // --- Collection 4: TreeMap ---
+    // WHY TreeMap: Keys are automatically sorted. We can do range queries like
+    // "find all products between $10 and $50" using subMap() in O(log n).
+    private final TreeMap<BigDecimal, List<Product>> priceIndex = new TreeMap<>();
+
+    // --- Collection 5: PriorityQueue ---
+    // WHY PriorityQueue: Restock requests must be processed by urgency.
+    // PriorityQueue always gives us the highest-priority request first.
+    private final PriorityQueue<RestockRequest> restockQueue = new PriorityQueue<>(
+        Comparator.comparing(RestockRequest::getPriority)     // Sort by priority (1=highest)
+                  .thenComparing(RestockRequest::getRequestedAt)  // Then by time (oldest first)
+    );
+
+    // --- Collection 6: LinkedHashMap (LRU Cache) ---
+    // WHY LinkedHashMap with accessOrder=true: Tracks access order.
+    // removeEldestEntry removes the least-recently-used item when cache is full.
+    private final Map<String, Product> lruCache = new LinkedHashMap<>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Product> eldest) {
+            return size() > 100;  // Keep only 100 most recently accessed products
+        }
+    };
+
+    @Autowired
+    private ProductRepository productRepository;
+
+    // --- Method using ArrayList + HashSet ---
+    public void refreshCatalog() {
+        List<Product> allProducts = productRepository.findAll();
+
+        catalogCache.clear();
+        catalogCache.addAll(allProducts);                     // ArrayList: ordered catalog
+
+        categories.clear();
+        allProducts.forEach(p -> categories.add(p.getCategory()));  // HashSet: unique categories
+    }
+
+    // --- Method using HashMap (O(1) lookup) ---
+    public Product findBySku(String sku) {
+        // Step 1: Check the cache first (O(1) lookup)
+        Product cached = skuCache.get(sku);
+        if (cached != null) return cached;
+
+        // Step 2: Cache miss -> load from database
+        Product product = productRepository.findBySku(sku)
+            .orElseThrow(() -> new ProductNotFoundException(sku));
+
+        // Step 3: Store in cache for future lookups
+        skuCache.put(sku, product);
+        return product;
+    }
+
+    // --- Method using TreeMap (range queries) ---
+    public List<Product> findByPriceRange(BigDecimal minPrice, BigDecimal maxPrice) {
+        // subMap returns all entries where key >= minPrice AND key <= maxPrice
+        // This is O(log n) to find the range, then O(k) to iterate results
+        return priceIndex.subMap(minPrice, true, maxPrice, true)
+            .values()
+            .stream()
+            .flatMap(Collection::stream)    // Flatten List<List<Product>> to List<Product>
+            .collect(Collectors.toList());
+    }
+
+    // --- Method using PriorityQueue ---
+    public void submitRestockRequest(String sku, int quantity, int priority) {
+        RestockRequest request = new RestockRequest(sku, quantity, priority, Instant.now());
+        restockQueue.offer(request);   // offer() adds to the correct position by priority
+    }
+
+    public RestockRequest processNextRestock() {
+        return restockQueue.poll();    // poll() returns and removes the highest-priority request
+    }
+
+    // --- Method using Collectors.groupingBy (Java 8 Streams + Map) ---
+    public Map<String, Long> getProductCountByCategory() {
+        return catalogCache.stream()
+            .collect(Collectors.groupingBy(
+                Product::getCategory,    // Group by category name
+                Collectors.counting()    // Count products in each category
+            ));
+    }
+
+    // --- Method using Comparator (sorting strategies) ---
+    public List<Product> getProductsSorted(String sortBy) {
+        Comparator<Product> comparator = switch (sortBy) {
+            case "price-asc"  -> Comparator.comparing(Product::getPrice);
+            case "price-desc" -> Comparator.comparing(Product::getPrice).reversed();
+            case "name"       -> Comparator.comparing(Product::getName);
+            case "stock"      -> Comparator.comparing(Product::getStockQuantity).reversed();
+            default           -> Comparator.comparing(Product::getId);
+        };
+
+        return catalogCache.stream()
+            .sorted(comparator)
+            .collect(Collectors.toList());
+    }
+}
+```
+
+---
+
+## Step 4: Create the REST Controller
+
+**Concept:** The controller maps HTTP requests to service methods. Each endpoint returns data as JSON.
+
+```java
+// src/main/java/com/app/controller/InventoryController.java
+@RestController                                   // Marks class as REST API controller
+@RequestMapping("/api/inventory")                 // Base URL for all endpoints
+@RequiredArgsConstructor
+public class InventoryController {
+
+    private final InventoryService inventoryService;
+
+    @GetMapping("/products")                      // GET /api/inventory/products?sortBy=price-asc
+    public List<Product> getProducts(@RequestParam(defaultValue = "name") String sortBy) {
+        return inventoryService.getProductsSorted(sortBy);
+    }
+
+    @GetMapping("/products/{sku}")                // GET /api/inventory/products/SKU-001
+    public Product getProduct(@PathVariable String sku) {
+        return inventoryService.findBySku(sku);
+    }
+
+    @GetMapping("/products/price-range")          // GET /api/inventory/products/price-range?min=10&max=50
+    public List<Product> getByPriceRange(
+            @RequestParam BigDecimal min,
+            @RequestParam BigDecimal max) {
+        return inventoryService.findByPriceRange(min, max);
+    }
+
+    @GetMapping("/categories/stats")              // GET /api/inventory/categories/stats
+    public Map<String, Long> getCategoryStats() {
+        return inventoryService.getProductCountByCategory();
+    }
+
+    @PostMapping("/restock")                      // POST /api/inventory/restock
+    public ResponseEntity<String> requestRestock(@RequestBody RestockRequest request) {
+        inventoryService.submitRestockRequest(
+            request.getSku(), request.getQuantity(), request.getPriority());
+        return ResponseEntity.accepted().body("Restock request queued");
+    }
+}
+```
+
+---
+
+## Step 5: Run and Test
+
+**Concept:** With H2 in-memory database, the application runs without any external database setup.
+
+```yaml
+# src/main/resources/application.yml
+spring:
+  datasource:
+    url: jdbc:h2:mem:inventorydb      # In-memory database -- data resets on restart
+    driver-class-name: org.h2.Driver
+  jpa:
+    hibernate:
+      ddl-auto: create-drop           # Create tables on start, drop on shutdown
+    show-sql: true                     # See SQL queries in console
+  h2:
+    console:
+      enabled: true                    # Access H2 console at /h2-console
+```
+
+```bash
+# Run the application
+mvn spring-boot:run
+
+# Test the endpoints
+curl http://localhost:8080/api/inventory/products?sortBy=price-asc
+curl http://localhost:8080/api/inventory/products/SKU-001
+curl http://localhost:8080/api/inventory/products/price-range?min=10&max=50
+curl http://localhost:8080/api/inventory/categories/stats
+```
+
+---
+
+## Key Takeaways -- Which Collection When
+
+| Need | Use | Why |
+|---|---|---|
+| Ordered list, random access | `ArrayList` | O(1) get by index, dynamic size |
+| Unique elements | `HashSet` | O(1) add/contains, auto-dedup |
+| Key-value lookup | `HashMap` | O(1) put/get by key |
+| Sorted keys, range queries | `TreeMap` | O(log n) with subMap/floorKey |
+| Priority processing | `PriorityQueue` | Always gives highest priority first |
+| Insertion-order tracking | `LinkedHashMap` | Preserves order, supports LRU |
+| Thread-safe map | `ConcurrentHashMap` | Lock-free reads, per-bucket locking |
+
+---
+
 
 
 # Chapter 14: Interview Preparation - 150+ Questions with Answers

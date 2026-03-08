@@ -1,6 +1,31 @@
 
 # Part 9: Transaction Management
 
+### What is Transaction Management in Spring?
+Spring's `@Transactional` annotation provides **declarative transaction management** — you annotate a method, and Spring automatically wraps it in a database transaction. No manual `begin/commit/rollback` code needed.
+
+### Why @Transactional Over Manual Transactions
+| Manual Transaction | @Transactional |
+|---|---|
+| 10+ lines of try/catch/finally | Single annotation |
+| Easy to forget rollback | Automatic rollback on exceptions |
+| Scattered across codebase | Clean separation of concerns |
+| Hard to test | Mockable, testable |
+
+### Step-by-Step: How @Transactional Works Internally
+```
+1. Spring creates a proxy around the @Service class
+2. When a @Transactional method is called:
+   a. Proxy intercepts the call
+   b. Opens a new transaction (or joins existing)
+   c. Calls the actual method
+   d. If method succeeds → COMMIT
+   e. If RuntimeException is thrown → ROLLBACK
+   f. If checked exception is thrown → COMMIT (by default!)
+```
+
+> **Critical Gotcha:** @Transactional does NOT work on `private` methods or when calling a @Transactional method from within the **same class** (self-invocation bypasses the proxy).
+
 ## 9.1 ACID Properties
 
 | Property | Meaning | Example |
@@ -11,6 +36,16 @@
 | **Durability** | Committed data survives crashes | After commit, data persists even if server restarts |
 
 ## 9.2 Spring @Transactional
+
+### When to Use @Transactional
+- **Service layer methods** that modify data (INSERT, UPDATE, DELETE)
+- **Multi-step operations** where all steps must succeed or fail together
+- Methods that read data and need **snapshot consistency** (`readOnly = true`)
+
+### When NOT to Use @Transactional
+- **Controller methods** — transactions should be scoped at the service layer
+- **Very long-running operations** — holding a transaction for minutes blocks database resources
+- **External API calls** within a transaction — the API call cannot be rolled back
 
 ```java
 @Service
@@ -44,6 +79,12 @@ public class OrderService {
 ```
 
 ## 9.3 Transaction Propagation
+
+### What is Transaction Propagation?
+Propagation defines what happens when a @Transactional method calls another @Transactional method. Should they share the same transaction? Create a new one? Throw an error?
+
+### Why This Matters in Production
+Consider: An order placement method calls an audit logging method. If the order fails and rolls back, should the audit log also roll back? Usually NO — you want the audit log to persist. This is where `REQUIRES_NEW` propagation saves you.
 
 | Propagation | Behavior | Use Case |
 |---|---|---|
@@ -97,6 +138,17 @@ public List<User> getAllActiveUsers() {
 ## 10.1 What is Spring Data JPA?
 
 **Spring Data JPA** is an abstraction layer on top of JPA/Hibernate that eliminates boilerplate repository code. You define an interface, and Spring generates the implementation at runtime.
+
+### Why Spring Data JPA Exists
+Without Spring Data JPA, every entity requires a repository class with 5+ methods of repetitive code (find, save, delete, update, count). Spring Data JPA generates these implementations **automatically** from just an interface declaration.
+
+### Design Patterns Used
+| Pattern | Where Used |
+|---|---|
+| **Repository Pattern** | Each interface represents a data access object for one entity |
+| **Proxy Pattern** | Spring creates a runtime proxy implementing the interface |
+| **Template Method** | `SimpleJpaRepository` provides default implementations |
+| **Strategy Pattern** | Query derivation strategies (method name, @Query, native) |
 
 ```java
 // WITHOUT Spring Data JPA -- manual repository
@@ -281,9 +333,21 @@ public interface ProductRepository extends JpaRepository<Product, Long> {
 
 # Part 13: Query Methods in Spring Data JPA
 
+### Three Ways to Define Queries in Spring Data JPA
+Spring Data JPA provides three strategies for creating queries, from simplest to most powerful:
+
+| Strategy | When to Use | Example |
+|---|---|---|
+| **Derived query (method name)** | Simple conditions (1-3 fields) | `findByName(String name)` |
+| **@Query (JPQL)** | Complex queries, joins, aggregations | `@Query("SELECT u FROM User u WHERE...")` |
+| **Native query** | Database-specific features, complex analytics | `@Query(value = "SELECT...", nativeQuery = true)` |
+
+> **Rule of Thumb:** Start with derived queries. Move to @Query when method names become unreadable (more than 3 conditions). Use native queries only when you need database-specific syntax.
+
 ## 13.1 Method Name Query Derivation
 
-Spring Data parses method names and generates JPQL automatically:
+### How It Works
+Spring Data parses method names and generates JPQL automatically. The method name IS the query — Spring breaks it into parts:
 
 ```java
 public interface UserRepository extends JpaRepository<User, Long> {
@@ -473,9 +537,26 @@ List<Product> sorted = productRepository.findAll(sort);
 
 # Part 16: Spring Data JPA Specifications
 
-## 16.1 Dynamic Queries with Specifications
+### What are Specifications?
+Specifications allow you to build **dynamic, composable queries** at runtime. Instead of writing separate repository methods for every possible filter combination, you create reusable building blocks that can be combined with AND/OR.
 
-For dashboards or search pages where filters are optional and dynamic.
+### Why Specifications Over Multiple Repository Methods
+Imagine a product search page with 6 optional filters (category, price range, keyword, brand, rating, availability). Without Specifications, you'd need 2⁶ = 64 repository methods for every possible combination. With Specifications, you need just 6 reusable building blocks.
+
+### When to Use Specifications
+- **Search/filter pages** with multiple optional criteria
+- **Admin dashboards** where users combine filters dynamically
+- When query conditions are known only at runtime
+
+### When NOT to Use Specifications
+- Simple, fixed queries — use derived query methods instead
+- Complex analytics — use native queries or views
+- When there are only 1-2 filter conditions
+
+### Design Pattern: Specification Pattern (Domain-Driven Design)
+This implements the **Specification pattern** from DDD — each specification encapsulates a single business rule that can be combined with `and()`, `or()`, `not()`.
+
+## 16.1 Dynamic Queries with Specifications
 
 ```java
 // Repository must extend JpaSpecificationExecutor

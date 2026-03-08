@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 
 const dir = path.join(__dirname);
-const sectionsDir = path.join(dir, 'sections');
+const filePath = path.join(dir, 'SpringBoot-MVC-REST-Mastering-Guide.md');
 
 const frontmatter = `---
 pdf_options:
@@ -32,19 +32,23 @@ blockquote { border-left: 4px solid #ff9800; background: #fff3e0; padding: 8px 1
 
 `;
 
-const files = [
-    'sec-01-foundation.md',
-    'sec-02-auth.md',
-    'sec-03-production.md',
-    'sec-04-interview.md'
-];
+let content = fs.readFileSync(filePath, 'utf8');
 
-let combined = frontmatter;
-
-for (const file of files) {
-    const content = fs.readFileSync(path.join(sectionsDir, file), 'utf8');
-    combined += content + '\n\n';
+// Strip old frontmatter/styles if already present to avoid duplication
+if (content.startsWith('---')) {
+    const parts = content.split('</style>\n\n');
+    if (parts.length > 1) {
+        content = parts.slice(1).join('</style>\n\n');
+    } else {
+        // Just in case it's a slightly different format
+        const match = content.match(/---[\s\S]*?---[\s\S]*?<style>[\s\S]*?<\/style>\s*/);
+        if (match) {
+            content = content.replace(match[0], '');
+        }
+    }
 }
+
+let combined = frontmatter + content;
 
 combined = combined
     .replace(/\u250C/g, '+').replace(/\u2510/g, '+').replace(/\u2514/g, '+').replace(/\u2518/g, '+')
@@ -58,5 +62,5 @@ combined = combined
     .replace(/\u201C/g, '"').replace(/\u201D/g, '"')
     .replace(/\u2018/g, "'").replace(/\u2019/g, "'");
 
-fs.writeFileSync(path.join(dir, 'Spring-Security-Mastering-Guide.md'), combined, 'utf8');
-console.log('Spring Security guide combined successfully.');
+fs.writeFileSync(filePath, combined, 'utf8');
+console.log('Spring Boot MVC REST guide formatted successfully.');

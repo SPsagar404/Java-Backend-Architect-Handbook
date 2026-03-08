@@ -691,3 +691,221 @@ public void processData() {
 | Replication lag | `SHOW SLAVE STATUS` | Seconds_Behind_Master |
 
 ---
+
+# Part 16: Build It Yourself — E-Commerce Database
+
+> **Goal:** Design and build a complete e-commerce database from scratch — schema, indexes, stored procedures, and Spring Boot integration.
+
+## Concept Overview
+
+```
+Tables:  customers → orders → order_items → products
+                              categories ←─┘
+```
+
+| Table | Purpose | Key Indexes |
+|---|---|---|
+| `customers` | Customer accounts | email (UNIQUE), status |
+| `products` | Product catalog | sku (UNIQUE), category_id + price |
+| `categories` | Product categories | name (UNIQUE) |
+| `orders` | Customer orders | customer_id + created_at, status |
+| `order_items` | Line items per order | order_id, product_id |
+
+---
+
+## Step 1: Create the Database Schema
+
+**Concept:** Design tables with proper data types, constraints, and indexes from the start.
+
+```sql
+CREATE DATABASE ecommerce CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE ecommerce;
+
+-- Customers table
+CREATE TABLE customers (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    first_name VARCHAR(100) NOT NULL,
+    last_name VARCHAR(100) NOT NULL,
+    email VARCHAR(255) NOT NULL UNIQUE,          -- UNIQUE = auto-creates index
+    phone VARCHAR(20),
+    status ENUM('ACTIVE','INACTIVE','BLOCKED') DEFAULT 'ACTIVE',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_customer_status (status)            -- Fast filtering by status
+);
+
+-- Categories table
+CREATE TABLE categories (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL UNIQUE,
+    parent_id INT,
+    FOREIGN KEY (parent_id) REFERENCES categories(id)
+);
+
+-- Products table
+CREATE TABLE products (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    sku VARCHAR(50) NOT NULL UNIQUE,
+    name VARCHAR(200) NOT NULL,
+    category_id INT NOT NULL,
+    price DECIMAL(10,2) NOT NULL,
+    stock_quantity INT DEFAULT 0,
+    status ENUM('ACTIVE','DISCONTINUED') DEFAULT 'ACTIVE',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (category_id) REFERENCES categories(id),
+    INDEX idx_product_category_price (category_id, price)  -- Composite index
+);
+
+-- Orders table
+CREATE TABLE orders (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    customer_id BIGINT NOT NULL,
+    total_amount DECIMAL(12,2) NOT NULL,
+    status ENUM('PENDING','CONFIRMED','SHIPPED','DELIVERED','CANCELLED') DEFAULT 'PENDING',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (customer_id) REFERENCES customers(id),
+    INDEX idx_order_customer_date (customer_id, created_at DESC)
+);
+
+-- Order items table
+CREATE TABLE order_items (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    order_id BIGINT NOT NULL,
+    product_id BIGINT NOT NULL,
+    quantity INT NOT NULL,
+    unit_price DECIMAL(10,2) NOT NULL,
+    line_total DECIMAL(12,2) GENERATED ALWAYS AS (quantity * unit_price) STORED,
+    FOREIGN KEY (order_id) REFERENCES orders(id),
+    FOREIGN KEY (product_id) REFERENCES products(id)
+);
+```
+
+---
+
+## Step 2: Insert Sample Data
+
+```sql
+INSERT INTO categories (name) VALUES ('Electronics'), ('Clothing'), ('Books');
+
+INSERT INTO products (sku, name, category_id, price, stock_quantity) VALUES
+('ELEC-001', 'Wireless Mouse', 1, 29.99, 500),
+('ELEC-002', 'USB-C Hub', 1, 49.99, 200),
+('CLT-001', 'Cotton T-Shirt', 2, 19.99, 1000),
+('BK-001', 'Java Concurrency in Practice', 3, 45.00, 150);
+
+INSERT INTO customers (first_name, last_name, email) VALUES
+('John', 'Doe', 'john@example.com'),
+('Jane', 'Smith', 'jane@example.com');
+```
+
+---
+
+## Step 3: Write Essential Queries
+
+```sql
+-- Top-selling products by revenue
+SELECT p.name, SUM(oi.quantity) AS units_sold, SUM(oi.line_total) AS revenue
+FROM order_items oi
+JOIN products p ON oi.product_id = p.id
+GROUP BY p.id ORDER BY revenue DESC LIMIT 10;
+
+-- Customer order history with totals
+SELECT c.first_name, c.last_name, COUNT(o.id) AS order_count,
+       SUM(o.total_amount) AS total_spent
+FROM customers c
+LEFT JOIN orders o ON c.id = o.customer_id
+GROUP BY c.id ORDER BY total_spent DESC;
+
+-- Low stock alert
+SELECT sku, name, stock_quantity FROM products
+WHERE stock_quantity < 10 AND status = 'ACTIVE';
+```
+
+---
+
+## Step 4: Create a Stored Procedure
+
+```sql
+DELIMITER //
+CREATE PROCEDURE PlaceOrder(
+    IN p_customer_id BIGINT,
+    IN p_product_id BIGINT,
+    IN p_quantity INT,
+    OUT p_order_id BIGINT,
+    OUT p_result VARCHAR(50)
+)
+BEGIN
+    DECLARE v_price DECIMAL(10,2);
+    DECLARE v_stock INT;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        SET p_result = 'ERROR';
+    END;
+
+    START TRANSACTION;
+
+    SELECT price, stock_quantity INTO v_price, v_stock
+    FROM products WHERE id = p_product_id FOR UPDATE;
+
+    IF v_stock < p_quantity THEN
+        SET p_result = 'INSUFFICIENT_STOCK';
+        ROLLBACK;
+    ELSE
+        INSERT INTO orders (customer_id, total_amount, status)
+        VALUES (p_customer_id, v_price * p_quantity, 'CONFIRMED');
+        SET p_order_id = LAST_INSERT_ID();
+
+        INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+        VALUES (p_order_id, p_product_id, p_quantity, v_price);
+
+        UPDATE products SET stock_quantity = stock_quantity - p_quantity
+        WHERE id = p_product_id;
+
+        SET p_result = 'SUCCESS';
+        COMMIT;
+    END IF;
+END //
+DELIMITER ;
+```
+
+---
+
+## Step 5: Call from Spring Boot
+
+```java
+@Repository
+public class OrderProcedureRepository {
+    @PersistenceContext private EntityManager em;
+
+    public OrderResult placeOrder(Long customerId, Long productId, int qty) {
+        StoredProcedureQuery query = em.createStoredProcedureQuery("PlaceOrder")
+            .registerStoredProcedureParameter("p_customer_id", Long.class, ParameterMode.IN)
+            .registerStoredProcedureParameter("p_product_id", Long.class, ParameterMode.IN)
+            .registerStoredProcedureParameter("p_quantity", Integer.class, ParameterMode.IN)
+            .registerStoredProcedureParameter("p_order_id", Long.class, ParameterMode.OUT)
+            .registerStoredProcedureParameter("p_result", String.class, ParameterMode.OUT)
+            .setParameter("p_customer_id", customerId)
+            .setParameter("p_product_id", productId)
+            .setParameter("p_quantity", qty);
+        query.execute();
+        return new OrderResult(
+            (Long) query.getOutputParameterValue("p_order_id"),
+            (String) query.getOutputParameterValue("p_result"));
+    }
+}
+```
+
+---
+
+## Key Takeaways
+
+| Concept | Remember |
+|---|---|
+| Index design | Create indexes on columns used in WHERE, JOIN, ORDER BY |
+| Composite indexes | Order matters: `(customer_id, created_at)` ≠ `(created_at, customer_id)` |
+| `FOR UPDATE` | Locks rows during transaction — prevents concurrent modification |
+| Stored procedures | Atomic operations that run entirely in the database |
+| `EXPLAIN` | Always check query plans before production deployment |
+
+---

@@ -5,6 +5,22 @@
 
 A trigger is a stored SQL program that **automatically executes** when a specific event (INSERT, UPDATE, DELETE) occurs on a table. Triggers fire without explicit calls.
 
+### Why Triggers Exist
+Triggers enforce **database-level business rules** that cannot be bypassed — regardless of whether data is modified by application code, direct SQL, batch jobs, or admin tools. They guarantee rules are applied consistently.
+
+### When to Use Triggers
+- **Audit logging** — automatically recording who changed what and when
+- **Data validation** — enforcing constraints that CHECK constraints cannot express
+- **Derived data maintenance** — auto-updating stock counts, balances, denormalized columns
+- **Soft delete enforcement** — preventing actual DELETE operations
+
+### When NOT to Use Triggers
+- **Complex business logic** — put it in the application layer where it's testable and debuggable
+- **Cross-table cascading updates** — hard to debug, causes hidden performance issues
+- **Notification/messaging** — use application events or Kafka instead
+
+> **Production Warning:** Triggers are invisible to application developers. Over-reliance on triggers makes the system hard to debug because side effects happen silently. Always document triggers prominently.
+
 ## 7.2 Trigger Types
 
 | Trigger | When It Fires | Common Use |
@@ -147,6 +163,27 @@ DELIMITER ;
 
 # Part 8: Indexing and Performance Optimization
 
+### Why Indexing is the Most Important Database Concept
+Indexing is the **single most impactful technique** for database performance. A missing index can make a query **1,000x slower**. Understanding indexing is what separates junior from senior database engineers.
+
+### How Indexing Works — The Book Analogy
+```
+A database index works exactly like a book's index:
+
+Without index:  Read every page to find "transactions" → 5 minutes
+With index:     Look up "transactions" in index → page 247 → 5 seconds
+
+A database index stores sorted key values with pointers to actual rows,
+allowing the engine to jump directly to matching rows instead of scanning all rows.
+```
+
+### Design Pattern: B+ Tree
+MySQL InnoDB indexes use **B+ Trees** — balanced tree structures where:
+- Leaf nodes contain actual data or pointers to data
+- Internal nodes contain keys for navigation
+- All leaf nodes are linked for range scans
+- Tree height is typically 3-4 levels, so any lookup takes 3-4 disk reads
+
 ## 8.1 What Is an Index?
 
 An index is a **data structure** (usually B+ tree) that speeds up data retrieval. Like a book's index that tells you which page a topic is on, a database index tells MySQL which row a value is in.
@@ -269,7 +306,39 @@ SELECT * FROM employees WHERE id = '42';  -- String compared to INT
 
 # Part 9: Transactions and Concurrency Control
 
-## 9.1 Transactions
+### What is a Transaction?
+A **transaction** is a group of SQL statements that are treated as a **single unit of work**. Either ALL statements succeed (COMMIT) or ALL are undone (ROLLBACK). There is no partial execution.
+
+### Why Transactions Matter
+Without transactions, a failure between two related operations leaves the database in an **inconsistent state**:
+```
+Transfer $500 from Account A to Account B:
+
+Without transaction:               With transaction:
+  1. Debit A: -$500  ✓              1. START TRANSACTION
+  2. ⚡ APPLICATION CRASHES ⚡       2. Debit A: -$500
+  3. Credit B: never happens!       3. Credit B: +$500
+  Result: $500 disappeared!         4. COMMIT (or ROLLBACK if error)
+                                    Result: Either both or neither
+```
+
+### ACID Properties
+| Property | Meaning | Guarantee |
+|---|---|---|
+| **Atomicity** | All or nothing | Transaction fully completes or fully rolls back |
+| **Consistency** | Valid state only | Database moves from one valid state to another |
+| **Isolation** | No interference | Concurrent transactions don't affect each other |
+| **Durability** | Permanent | Committed data survives crashes |
+
+### Step-by-Step: Transaction Lifecycle
+```
+1. START TRANSACTION  → Begin a new unit of work
+2. Execute SQL statements (INSERT, UPDATE, DELETE)
+3. If all succeed:  COMMIT   → Changes written to disk permanently
+4. If any fails:    ROLLBACK → All changes undone, as if nothing happened
+```
+
+## 9.1 Transaction Syntax
 
 ```sql
 -- Transfer $500 from account 1 to account 2
@@ -306,6 +375,29 @@ COMMIT;
 ```
 
 ## 9.3 Isolation Levels
+
+### What Are Isolation Levels?
+Isolation levels define **how much one transaction can see another transaction's uncommitted changes**. Higher isolation = more consistency but lower performance (more locking).
+
+### Why Multiple Isolation Levels Exist
+Full isolation (SERIALIZABLE) is the safest but slowest. Most applications don't need it. Isolation levels let you **trade consistency for performance** based on your use case:
+
+```
+Less Isolation                                    More Isolation
+More Performance                                  Less Performance
+┌────────────────┐┌──────────────┐┌───────────────┐┌──────────────┐
+│READ UNCOMMITTED││READ COMMITTED││REPEATABLE READ││ SERIALIZABLE │
+└────────────────┘└──────────────┘└───────────────┘└──────────────┘
+   Never use            Oracle/PG         MySQL default        Financial
+   in production        default                               systems only
+```
+
+### When to Use Each Level
+| Level | Use When |
+|---|---|
+| READ COMMITTED | Most web apps; good balance of performance and consistency |
+| REPEATABLE READ | Default in MySQL; prevents most anomalies |
+| SERIALIZABLE | Financial transactions where absolute consistency is required |
 
 | Level | Dirty Read | Non-Repeatable Read | Phantom Read | Performance |
 |---|---|---|---|---|
@@ -383,6 +475,18 @@ WHERE id = 2;   -- WAITS for T2   WHERE id = 1;   -- WAITS for T1
 ---
 
 # Part 10: Query Optimization
+
+### Why Query Optimization Matters
+In production, a single unoptimized query can bring down an entire application. Understanding the EXPLAIN output and optimization techniques is essential for any backend engineer.
+
+### The Optimization Process
+```
+Step 1: Identify slow queries (slow query log or APM tools)
+Step 2: Run EXPLAIN on the query
+Step 3: Analyze the execution plan (scan type, rows, indexes)
+Step 4: Apply optimization (add index, rewrite query, restructure)
+Step 5: Re-run EXPLAIN to verify improvement
+```
 
 ## 10.1 EXPLAIN Command
 
@@ -497,7 +601,19 @@ SELECT * FROM customers c WHERE EXISTS (
 
 # Part 11: Real Production Database Scenarios
 
+### Why Production SQL Differs from Textbook SQL
+Production database code must handle:
+- **Concurrent access** — multiple users hitting the same data simultaneously
+- **Failure recovery** — transactions, savepoints, error handlers
+- **Performance at scale** — millions of rows, complex joins, indexes
+- **Data integrity** — foreign keys, constraints, FOR UPDATE locks
+
+The following stored procedures demonstrate how these concerns are handled in real enterprise systems.
+
 ## 11.1 Order Processing System
+
+### Concept: Atomic Multi-Table Operations
+Placing an order involves multiple tables (orders, order_items, products). All must succeed or all must fail. The stored procedure uses `FOR UPDATE` to lock product rows and prevent overselling.
 
 ```sql
 -- Place an order (transaction ensures atomicity)

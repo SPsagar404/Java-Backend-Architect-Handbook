@@ -1,6 +1,29 @@
 
 # Part 7: Spring Batch Architecture
 
+### What is Spring Batch?
+Spring Batch is an enterprise-grade framework for **batch processing** — the automated, unattended processing of large volumes of data. It provides reusable components for reading, processing, and writing data with built-in transaction management, error handling, and restart capability.
+
+### Why Spring Batch Over Custom Solutions
+| Custom batch code | Spring Batch |
+|---|---|
+| Manual loop over records | Chunk-based processing with automatic transactions |
+| No restart capability | Restart from last successful chunk after failure |
+| Manual error handling | Skip, retry, and error policies built-in |
+| No execution tracking | Full execution metadata (JobRepository) |
+| Custom scheduling | Integration with Spring Scheduler, Quartz |
+
+### When to Use Spring Batch
+- Processing **thousands to millions of records** (invoices, statements, reports)
+- **Nightly/scheduled jobs** (data migration, ETL, reconciliation)
+- When you need **restartability** after failures
+- When you need **audit trails** of batch executions
+
+### When NOT to Use Spring Batch
+- **Real-time processing** — use event-driven (Kafka) or reactive (WebFlux)
+- **Simple cron tasks** with no large data processing — use `@Scheduled` instead
+- **Streaming data** — use Kafka Streams or Spring Cloud Stream
+
 ## 7.1 Core Architecture
 
 ```
@@ -71,6 +94,19 @@ Chunk Processing Flow (chunk-size = 100):
 ---
 
 # Part 8: Spring Batch Components
+
+### Component Overview
+Every Spring Batch job follows the **Reader → Processor → Writer** pattern (inspired by the ETL pattern from data warehousing). Each component has a single responsibility:
+
+| Component | Responsibility | Analogy |
+|---|---|---|
+| **Job** | The entire batch workflow | A recipe |
+| **Step** | One phase of the workflow | One cooking step |
+| **ItemReader** | Read one item at a time from source | Get ingredients |
+| **ItemProcessor** | Transform/validate one item | Prepare ingredients |
+| **ItemWriter** | Write a batch of items to target | Cook and plate |
+| **JobRepository** | Store execution metadata | Chef's journal |
+| **JobLauncher** | Trigger job execution | Starting the timer |
 
 ## 8.1 Job
 
@@ -336,6 +372,30 @@ src/main/java/com/company/batchservice/
 ---
 
 # Part 10: Complete Batch Job Implementation
+
+### Step-by-Step: Building a Batch Job
+This section demonstrates building a complete invoice generation job. Before writing code, understand the data flow:
+
+```
+Data Flow:
+  Database (Customer table)
+       │
+  [ItemReader] reads one Customer at a time
+       │
+  [ItemProcessor] calculates invoice for that Customer
+       │
+  [ItemWriter] saves batch of Invoices to database
+       │
+  Repeat until all Customers processed
+```
+
+### Design Decisions for This Job
+| Decision | Choice | Why |
+|---|---|---|
+| Reader type | JpaPagingItemReader | Large dataset, paging avoids OOM |
+| Chunk size | 100 | Balance between speed and memory |
+| Error handling | Skip up to 10, retry 3x | Resilient to transient failures |
+| Listener | JobCompletionListener | Send email report after job |
 
 ## 10.1 Entity
 

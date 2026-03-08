@@ -33,10 +33,10 @@ blockquote { border-left: 4px solid #ff9800; background: #fff3e0; padding: 8px 1
 `;
 
 const files = [
-    'sec-01-foundation.md',
-    'sec-02-auth.md',
-    'sec-03-production.md',
-    'sec-04-interview.md'
+    'ms-01-foundation.md',
+    'ms-02-patterns.md',
+    'ms-03-production.md',
+    'ms-04-interview.md'
 ];
 
 let combined = frontmatter;
@@ -58,5 +58,5 @@ combined = combined
     .replace(/\u201C/g, '"').replace(/\u201D/g, '"')
     .replace(/\u2018/g, "'").replace(/\u2019/g, "'");
 
-fs.writeFileSync(path.join(dir, 'Spring-Security-Mastering-Guide.md'), combined, 'utf8');
-console.log('Spring Security guide combined successfully.');
+fs.writeFileSync(path.join(dir, 'Microservices-Architecture-Mastering-Guide.md'), combined, 'utf8');
+console.log('Microservices Architecture guide combined successfully.');

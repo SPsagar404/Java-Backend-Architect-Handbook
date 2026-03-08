@@ -881,6 +881,31 @@ List<Object[]> getUserOrderCounts();
 
 # Part 9: Transaction Management
 
+### What is Transaction Management in Spring?
+Spring's `@Transactional` annotation provides **declarative transaction management** -- you annotate a method, and Spring automatically wraps it in a database transaction. No manual `begin/commit/rollback` code needed.
+
+### Why @Transactional Over Manual Transactions
+| Manual Transaction | @Transactional |
+|---|---|
+| 10+ lines of try/catch/finally | Single annotation |
+| Easy to forget rollback | Automatic rollback on exceptions |
+| Scattered across codebase | Clean separation of concerns |
+| Hard to test | Mockable, testable |
+
+### Step-by-Step: How @Transactional Works Internally
+```
+1. Spring creates a proxy around the @Service class
+2. When a @Transactional method is called:
+   a. Proxy intercepts the call
+   b. Opens a new transaction (or joins existing)
+   c. Calls the actual method
+   d. If method succeeds -> COMMIT
+   e. If RuntimeException is thrown -> ROLLBACK
+   f. If checked exception is thrown -> COMMIT (by default!)
+```
+
+> **Critical Gotcha:** @Transactional does NOT work on `private` methods or when calling a @Transactional method from within the **same class** (self-invocation bypasses the proxy).
+
 ## 9.1 ACID Properties
 
 | Property | Meaning | Example |
@@ -891,6 +916,16 @@ List<Object[]> getUserOrderCounts();
 | **Durability** | Committed data survives crashes | After commit, data persists even if server restarts |
 
 ## 9.2 Spring @Transactional
+
+### When to Use @Transactional
+- **Service layer methods** that modify data (INSERT, UPDATE, DELETE)
+- **Multi-step operations** where all steps must succeed or fail together
+- Methods that read data and need **snapshot consistency** (`readOnly = true`)
+
+### When NOT to Use @Transactional
+- **Controller methods** -- transactions should be scoped at the service layer
+- **Very long-running operations** -- holding a transaction for minutes blocks database resources
+- **External API calls** within a transaction -- the API call cannot be rolled back
 
 ```java
 @Service
@@ -924,6 +959,12 @@ public class OrderService {
 ```
 
 ## 9.3 Transaction Propagation
+
+### What is Transaction Propagation?
+Propagation defines what happens when a @Transactional method calls another @Transactional method. Should they share the same transaction? Create a new one? Throw an error?
+
+### Why This Matters in Production
+Consider: An order placement method calls an audit logging method. If the order fails and rolls back, should the audit log also roll back? Usually NO -- you want the audit log to persist. This is where `REQUIRES_NEW` propagation saves you.
 
 | Propagation | Behavior | Use Case |
 |---|---|---|
@@ -977,6 +1018,17 @@ public List<User> getAllActiveUsers() {
 ## 10.1 What is Spring Data JPA?
 
 **Spring Data JPA** is an abstraction layer on top of JPA/Hibernate that eliminates boilerplate repository code. You define an interface, and Spring generates the implementation at runtime.
+
+### Why Spring Data JPA Exists
+Without Spring Data JPA, every entity requires a repository class with 5+ methods of repetitive code (find, save, delete, update, count). Spring Data JPA generates these implementations **automatically** from just an interface declaration.
+
+### Design Patterns Used
+| Pattern | Where Used |
+|---|---|
+| **Repository Pattern** | Each interface represents a data access object for one entity |
+| **Proxy Pattern** | Spring creates a runtime proxy implementing the interface |
+| **Template Method** | `SimpleJpaRepository` provides default implementations |
+| **Strategy Pattern** | Query derivation strategies (method name, @Query, native) |
 
 ```java
 // WITHOUT Spring Data JPA -- manual repository
@@ -1161,9 +1213,21 @@ public interface ProductRepository extends JpaRepository<Product, Long> {
 
 # Part 13: Query Methods in Spring Data JPA
 
+### Three Ways to Define Queries in Spring Data JPA
+Spring Data JPA provides three strategies for creating queries, from simplest to most powerful:
+
+| Strategy | When to Use | Example |
+|---|---|---|
+| **Derived query (method name)** | Simple conditions (1-3 fields) | `findByName(String name)` |
+| **@Query (JPQL)** | Complex queries, joins, aggregations | `@Query("SELECT u FROM User u WHERE...")` |
+| **Native query** | Database-specific features, complex analytics | `@Query(value = "SELECT...", nativeQuery = true)` |
+
+> **Rule of Thumb:** Start with derived queries. Move to @Query when method names become unreadable (more than 3 conditions). Use native queries only when you need database-specific syntax.
+
 ## 13.1 Method Name Query Derivation
 
-Spring Data parses method names and generates JPQL automatically:
+### How It Works
+Spring Data parses method names and generates JPQL automatically. The method name IS the query -- Spring breaks it into parts:
 
 ```java
 public interface UserRepository extends JpaRepository<User, Long> {
@@ -1353,9 +1417,26 @@ List<Product> sorted = productRepository.findAll(sort);
 
 # Part 16: Spring Data JPA Specifications
 
-## 16.1 Dynamic Queries with Specifications
+### What are Specifications?
+Specifications allow you to build **dynamic, composable queries** at runtime. Instead of writing separate repository methods for every possible filter combination, you create reusable building blocks that can be combined with AND/OR.
 
-For dashboards or search pages where filters are optional and dynamic.
+### Why Specifications Over Multiple Repository Methods
+Imagine a product search page with 6 optional filters (category, price range, keyword, brand, rating, availability). Without Specifications, you'd need 2⁶ = 64 repository methods for every possible combination. With Specifications, you need just 6 reusable building blocks.
+
+### When to Use Specifications
+- **Search/filter pages** with multiple optional criteria
+- **Admin dashboards** where users combine filters dynamically
+- When query conditions are known only at runtime
+
+### When NOT to Use Specifications
+- Simple, fixed queries -- use derived query methods instead
+- Complex analytics -- use native queries or views
+- When there are only 1-2 filter conditions
+
+### Design Pattern: Specification Pattern (Domain-Driven Design)
+This implements the **Specification pattern** from DDD -- each specification encapsulates a single business rule that can be combined with `and()`, `or()`, `not()`.
+
+## 16.1 Dynamic Queries with Specifications
 
 ```java
 // Repository must extend JpaSpecificationExecutor
@@ -2016,6 +2097,164 @@ public void handleOrderCreated(OrderCreatedEvent event) {
     inventoryService.reserveStock(event.getOrderId(), event.getItems());
 }
 ```
+
+---
+
+# Part 22: Build It Yourself -- User Management with JPA
+
+> **Goal:** Build a Spring Boot User Management REST API using Hibernate/JPA, covering entities, repositories, service layer, and performance optimization.
+
+## Concept Overview
+
+| Layer | Technology | Purpose |
+|---|---|---|
+| Entity | `@Entity`, `@Table`, `@ManyToOne` | Maps Java objects to database tables |
+| Repository | `JpaRepository`, `@Query` | Data access without writing SQL |
+| Service | `@Transactional`, dirty checking | Business logic with automatic transaction management |
+| DTO | Record classes | Decouple API from internal entities |
+
+---
+
+## Step 1: Define Entities with Relationships
+
+**Concept:** Each `@Entity` class maps to a database table. Relationships use `@ManyToOne` (owning side with FK) and `@OneToMany` (inverse side).
+
+```java
+@Entity
+@Table(name = "users",
+    indexes = @Index(name = "idx_user_email", columnList = "email"))
+@Data @NoArgsConstructor @AllArgsConstructor @Builder
+public class User {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, length = 100)
+    private String firstName;
+
+    @Column(nullable = false, unique = true)
+    private String email;
+
+    @Enumerated(EnumType.STRING)
+    private UserStatus status = UserStatus.ACTIVE;
+
+    @Embedded                                  // Value object stored in same table
+    private Address address;
+
+    @OneToMany(mappedBy = "user",              // Inverse side -- no FK here
+               cascade = CascadeType.ALL,
+               orphanRemoval = true)
+    private List<Order> orders = new ArrayList<>();
+
+    @Column(updatable = false)
+    private LocalDateTime createdAt;
+
+    @PrePersist
+    void onCreate() { createdAt = LocalDateTime.now(); }
+
+    // Helper method for bidirectional consistency
+    public void addOrder(Order order) {
+        orders.add(order);
+        order.setUser(this);
+    }
+}
+```
+
+---
+
+## Step 2: Create the Repository
+
+**Concept:** `JpaRepository` gives you CRUD + paging for free. Custom queries use `@Query` (JPQL) or derived method names.
+
+```java
+public interface UserRepository extends JpaRepository<User, Long> {
+
+    Optional<User> findByEmail(String email);          // Derived query -- Spring generates SQL
+
+    boolean existsByEmail(String email);               // EXISTS query -- efficient
+
+    @Query("SELECT u FROM User u WHERE u.status = :status")
+    Page<User> findByStatus(@Param("status") UserStatus status, Pageable pageable);
+
+    @EntityGraph(attributePaths = {"orders"})           // Fetch orders eagerly (avoids N+1)
+    Optional<User> findWithOrdersById(Long id);
+
+    @Modifying @Transactional
+    @Query("UPDATE User u SET u.status = 'INACTIVE' WHERE u.createdAt < :cutoff")
+    int deactivateOldUsers(@Param("cutoff") LocalDateTime cutoff);
+}
+```
+
+---
+
+## Step 3: Build the Service Layer
+
+**Concept:** `@Transactional` manages database transactions. Dirty checking automatically saves changes to persistent entities -- no explicit `save()` needed for updates.
+
+```java
+@Service
+@RequiredArgsConstructor
+public class UserService {
+
+    private final UserRepository userRepository;
+
+    @Transactional
+    public UserDTO createUser(CreateUserRequest req) {
+        if (userRepository.existsByEmail(req.email())) {
+            throw new DuplicateEmailException(req.email());
+        }
+        User user = User.builder()
+            .firstName(req.firstName())
+            .email(req.email())
+            .build();
+        return UserDTO.from(userRepository.save(user));
+    }
+
+    @Transactional(readOnly = true)       // Read-only = no dirty checking overhead
+    public Page<UserDTO> listUsers(int page, int size) {
+        return userRepository.findAll(PageRequest.of(page, size))
+            .map(UserDTO::from);
+    }
+
+    @Transactional
+    public UserDTO updateUser(Long id, UpdateUserRequest req) {
+        User user = userRepository.findById(id)
+            .orElseThrow(() -> new UserNotFoundException(id));
+        user.setFirstName(req.firstName());
+        // NO save() needed -- dirty checking auto-persists on commit
+        return UserDTO.from(user);
+    }
+}
+```
+
+---
+
+## Step 4: Performance Optimization
+
+```yaml
+spring:
+  jpa:
+    properties:
+      hibernate:
+        default_batch_fetch_size: 25     # Batch-fetch lazy collections
+        jdbc:
+          batch_size: 50                  # Batch INSERTs/UPDATEs
+        order_inserts: true               # Group INSERTs by entity type
+        order_updates: true
+    show-sql: true                        # See generated SQL
+```
+
+---
+
+## Key Takeaways
+
+| Concept | Remember |
+|---|---|
+| `@ManyToOne(fetch = LAZY)` | Always set LAZY -- override EAGER defaults |
+| `mappedBy` | Inverse side has NO FK column -- it's a mirror |
+| Dirty checking | Persistent entities auto-save on transaction commit |
+| `@EntityGraph` | Solve N+1 by fetching associations in a single query |
+| `@Transactional(readOnly = true)` | Better performance for read operations |
+| DTO projections | Don't expose entities directly -- use DTOs |
 
 ---
 

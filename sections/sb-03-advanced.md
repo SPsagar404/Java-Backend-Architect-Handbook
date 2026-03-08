@@ -440,3 +440,189 @@ public class NotificationEventWriter implements ItemWriter<Notice> {
 ```
 
 ---
+
+# Part 18: Build It Yourself — Daily Invoice Generation Batch Job
+
+> **Goal:** Build a Spring Batch job that reads customers, generates invoices, and writes results — with scheduling and error handling.
+
+## Concept Overview
+
+```
+Spring Batch Flow:
+  @Scheduled → JobLauncher → Job → Step → Reader → Processor → Writer
+                                          (DB)     (Calculate)  (DB)
+```
+
+| Component | What It Does | Why |
+|---|---|---|
+| `ItemReader` | Reads customers in pages | Prevents memory overflow |
+| `ItemProcessor` | Calculates invoice amounts | Business logic transformation |
+| `ItemWriter` | Saves invoices in batches | Performance optimization |
+| Chunk processing | Groups of 100 per transaction | Limits rollback scope |
+
+---
+
+## Step 1: Add Dependencies
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-batch</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-jpa</artifactId>
+</dependency>
+```
+
+---
+
+## Step 2: Define Entities
+
+```java
+@Entity @Table(name = "customers")
+@Data @NoArgsConstructor @AllArgsConstructor @Builder
+public class Customer {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String name;
+    private String email;
+    private BigDecimal monthlyRate;
+    private boolean active;
+}
+
+@Entity @Table(name = "invoices")
+@Data @NoArgsConstructor @AllArgsConstructor @Builder
+public class Invoice {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private Long customerId;
+    private String invoiceNumber;
+    private BigDecimal amount;
+    private BigDecimal tax;
+    private BigDecimal totalAmount;
+    private String month;
+    private LocalDateTime generatedAt;
+}
+```
+
+---
+
+## Step 3: Create the Batch Job Configuration
+
+```java
+@Configuration
+public class InvoiceBatchConfig {
+
+    // READER: Reads active customers in pages of 100
+    @Bean
+    public JpaPagingItemReader<Customer> customerReader(EntityManagerFactory emf) {
+        return new JpaPagingItemReaderBuilder<Customer>()
+            .name("customerReader")
+            .entityManagerFactory(emf)
+            .queryString("SELECT c FROM Customer c WHERE c.active = true")
+            .pageSize(100)
+            .build();
+    }
+
+    // PROCESSOR: Transforms Customer → Invoice (business logic)
+    @Bean
+    public ItemProcessor<Customer, Invoice> invoiceProcessor() {
+        return customer -> {
+            BigDecimal tax = customer.getMonthlyRate().multiply(new BigDecimal("0.18"));
+            return Invoice.builder()
+                .customerId(customer.getId())
+                .invoiceNumber("INV-" + YearMonth.now() + "-" + customer.getId())
+                .amount(customer.getMonthlyRate())
+                .tax(tax)
+                .totalAmount(customer.getMonthlyRate().add(tax))
+                .month(YearMonth.now().toString())
+                .generatedAt(LocalDateTime.now())
+                .build();
+        };
+    }
+
+    // WRITER: Saves invoices to database
+    @Bean
+    public JpaItemWriter<Invoice> invoiceWriter(EntityManagerFactory emf) {
+        JpaItemWriter<Invoice> writer = new JpaItemWriter<>();
+        writer.setEntityManagerFactory(emf);
+        return writer;
+    }
+
+    // STEP: Read → Process → Write in chunks of 100
+    @Bean
+    public Step invoiceStep(JobRepository jobRepo, PlatformTransactionManager txMgr) {
+        return new StepBuilder("invoiceStep", jobRepo)
+            .<Customer, Invoice>chunk(100, txMgr)
+            .reader(customerReader(null))
+            .processor(invoiceProcessor())
+            .writer(invoiceWriter(null))
+            .faultTolerant()
+            .skipLimit(50).skip(Exception.class)       // Skip bad records
+            .retryLimit(3).retry(TransientDataAccessException.class)  // Retry on DB timeout
+            .build();
+    }
+
+    // JOB: Container for steps
+    @Bean
+    public Job invoiceJob(JobRepository jobRepo, Step invoiceStep) {
+        return new JobBuilder("invoiceJob", jobRepo)
+            .start(invoiceStep)
+            .build();
+    }
+}
+```
+
+---
+
+## Step 4: Schedule the Job
+
+```java
+@Component
+public class InvoiceJobScheduler {
+
+    @Autowired private JobLauncher jobLauncher;
+    @Autowired private Job invoiceJob;
+
+    @Scheduled(cron = "0 0 0 1 * *")     // Midnight on 1st of every month
+    public void triggerMonthlyInvoicing() {
+        try {
+            JobParameters params = new JobParametersBuilder()
+                .addString("month", YearMonth.now().toString())
+                .addLong("timestamp", System.currentTimeMillis())
+                .toJobParameters();
+            jobLauncher.run(invoiceJob, params);
+        } catch (Exception e) {
+            log.error("Invoice job failed!", e);
+        }
+    }
+}
+```
+
+---
+
+## Step 5: Configure and Run
+
+```yaml
+spring:
+  batch:
+    jdbc:
+      initialize-schema: always
+    job:
+      enabled: false                   # Don't auto-run on startup
+```
+
+---
+
+## Key Takeaways
+
+| Concept | Remember |
+|---|---|
+| Chunk processing | Read-Process-Write in batch sizes (e.g., 100) |
+| Each chunk = 1 transaction | Failure rolls back only that chunk |
+| Skip/Retry | Bad records logged and skipped, job continues |
+| Job Parameters | Make each run unique with timestamp |
+| @Scheduled + JobLauncher | Fully automated batch processing |
+
+---

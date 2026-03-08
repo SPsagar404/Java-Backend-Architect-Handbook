@@ -3,7 +3,32 @@
 
 ## 7.1 What is JWT?
 
-**JSON Web Token (JWT)** is a compact, self-contained token used for securely transmitting information between parties. It contains all user information needed for authentication -- no server-side session storage required.
+**JSON Web Token (JWT)** is a compact, self-contained token used for securely transmitting information between parties. It contains all user information needed for authentication — no server-side session storage required.
+
+### Why JWT Over Session-Based Authentication
+| Session-Based | JWT |
+|---|---|
+| Server stores session in memory/Redis | Token stored on client (stateless server) |
+| Requires sticky sessions for scaling | Any server can validate the token |
+| Difficult for mobile apps | Works with any HTTP client |
+| CSRF vulnerable (cookie-based) | Not CSRF vulnerable (header-based) |
+| Easy to revoke (delete session) | Hard to revoke (needs blacklist) |
+
+### When to Use JWT
+- **REST APIs** consumed by SPAs, mobile apps, or other services
+- **Microservices** — stateless authentication without shared session store
+- When you need **self-contained tokens** that carry user claims
+
+### When NOT to Use JWT
+- **Traditional server-rendered web apps** — sessions are simpler
+- When **instant revocation** is critical — JWT tokens are valid until expiry
+- For **very sensitive operations** — combine JWT with additional verification
+
+### Security Best Practices
+- Use short-lived **access tokens** (15-30 minutes) + longer **refresh tokens** (7 days)
+- Store tokens in **httpOnly cookies** (not localStorage) for web apps
+- Always use **HTTPS**
+- Rotate signing keys periodically
 
 ## 7.2 JWT Structure
 
@@ -200,6 +225,26 @@ public class AuthController {
 
 # Part 8: Spring Security with OAuth2
 
+### What is OAuth2?
+**OAuth 2.0** is an **authorization framework** that allows third-party applications to access a user's data without knowing their password. It's the protocol behind "Login with Google/GitHub/Facebook" buttons.
+
+### Why OAuth2 Exists
+Before OAuth2, applications asked users for their Google/Facebook password directly. This was a security nightmare. OAuth2 solves this by giving the application a **limited-scope access token** instead of the user's credentials.
+
+### Key Insight: Authentication vs Authorization
+- **OAuth2** is for **authorization** (what can you access?)
+- **OpenID Connect (OIDC)** is for **authentication** (who are you?) — built on top of OAuth2
+- In practice, "Login with Google" uses OIDC, which is OAuth2 + user identity
+
+### When to Use OAuth2
+- **Social login** — "Login with Google/GitHub"
+- **Service-to-service** communication (Client Credentials flow)
+- When you need a **centralized identity provider** (Keycloak, Auth0)
+
+### When NOT to Use OAuth2
+- Simple applications with their own login form — use username/password + JWT
+- Internal tools with limited users — use basic auth or LDAP
+
 ## 8.1 OAuth2 Concepts
 
 ```
@@ -344,6 +389,25 @@ public class CustomOAuth2UserService
 
 # Part 9: Role-Based Access Control (RBAC)
 
+### What is RBAC?
+**Role-Based Access Control** assigns permissions through **roles** rather than directly to users. A user is assigned roles (ADMIN, USER, MANAGER), and each role has a set of permissions.
+
+### Why RBAC Over Direct Permissions
+```
+Direct Permissions (hard to manage):     RBAC (scalable):
+  User1 → [read, write, delete]          User1 → ADMIN role → [read, write, delete]
+  User2 → [read, write, delete]          User2 → ADMIN role → [read, write, delete]
+  User3 → [read]                         User3 → USER role  → [read]
+
+  To add a new permission:               To add a new permission:
+  Update ALL admin users individually    Update the ADMIN role once
+```
+
+### Design Pattern: Two-Level Authorization
+Spring Security supports both coarse-grained (role) and fine-grained (authority) access control:
+- **URL-based security** (coarse) — configured in `SecurityFilterChain`
+- **Method-level security** (fine) — `@PreAuthorize`, `@Secured` annotations
+
 ## 9.1 Roles vs Authorities
 
 ```
@@ -478,6 +542,22 @@ CREATE TABLE role_permissions (
 
 # Part 10: Security Filter Chain Deep Dive
 
+### What is the Security Filter Chain?
+The **Security Filter Chain** is a series of servlet filters that process every HTTP request before it reaches your controller. Each filter handles one specific security concern (authentication, CSRF, session management, authorization).
+
+### Why Understanding the Filter Chain Matters
+- To add **custom authentication** (JWT filter), you must know WHERE to insert it
+- To debug security issues, you need to understand WHICH filter is rejecting the request
+- To customize error responses (401/403), you need to know which filter handles them
+
+### Key Insight
+```
+The order of filters matters!
+  - Authentication filters run BEFORE authorization filters
+  - If a request passes all filters, it's both authenticated AND authorized
+  - Your custom JWT filter should run BEFORE UsernamePasswordAuthenticationFilter
+```
+
 ## 10.1 Default Filter Execution Order
 
 ```
@@ -589,6 +669,9 @@ public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
 ---
 
 # Part 11: Session-Based vs Token-Based Authentication
+
+### Why This Comparison Matters
+Choosing between session-based and token-based authentication is one of the most important architectural decisions for your application. It affects scalability, security, and how you handle authentication across your entire system.
 
 ## 11.1 Comparison
 

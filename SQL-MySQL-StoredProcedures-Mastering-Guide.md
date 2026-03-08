@@ -934,6 +934,22 @@ DELIMITER ;
 
 A trigger is a stored SQL program that **automatically executes** when a specific event (INSERT, UPDATE, DELETE) occurs on a table. Triggers fire without explicit calls.
 
+### Why Triggers Exist
+Triggers enforce **database-level business rules** that cannot be bypassed -- regardless of whether data is modified by application code, direct SQL, batch jobs, or admin tools. They guarantee rules are applied consistently.
+
+### When to Use Triggers
+- **Audit logging** -- automatically recording who changed what and when
+- **Data validation** -- enforcing constraints that CHECK constraints cannot express
+- **Derived data maintenance** -- auto-updating stock counts, balances, denormalized columns
+- **Soft delete enforcement** -- preventing actual DELETE operations
+
+### When NOT to Use Triggers
+- **Complex business logic** -- put it in the application layer where it's testable and debuggable
+- **Cross-table cascading updates** -- hard to debug, causes hidden performance issues
+- **Notification/messaging** -- use application events or Kafka instead
+
+> **Production Warning:** Triggers are invisible to application developers. Over-reliance on triggers makes the system hard to debug because side effects happen silently. Always document triggers prominently.
+
 ## 7.2 Trigger Types
 
 | Trigger | When It Fires | Common Use |
@@ -1076,6 +1092,27 @@ DELIMITER ;
 
 # Part 8: Indexing and Performance Optimization
 
+### Why Indexing is the Most Important Database Concept
+Indexing is the **single most impactful technique** for database performance. A missing index can make a query **1,000x slower**. Understanding indexing is what separates junior from senior database engineers.
+
+### How Indexing Works -- The Book Analogy
+```
+A database index works exactly like a book's index:
+
+Without index:  Read every page to find "transactions" -> 5 minutes
+With index:     Look up "transactions" in index -> page 247 -> 5 seconds
+
+A database index stores sorted key values with pointers to actual rows,
+allowing the engine to jump directly to matching rows instead of scanning all rows.
+```
+
+### Design Pattern: B+ Tree
+MySQL InnoDB indexes use **B+ Trees** -- balanced tree structures where:
+- Leaf nodes contain actual data or pointers to data
+- Internal nodes contain keys for navigation
+- All leaf nodes are linked for range scans
+- Tree height is typically 3-4 levels, so any lookup takes 3-4 disk reads
+
 ## 8.1 What Is an Index?
 
 An index is a **data structure** (usually B+ tree) that speeds up data retrieval. Like a book's index that tells you which page a topic is on, a database index tells MySQL which row a value is in.
@@ -1198,7 +1235,39 @@ SELECT * FROM employees WHERE id = '42';  -- String compared to INT
 
 # Part 9: Transactions and Concurrency Control
 
-## 9.1 Transactions
+### What is a Transaction?
+A **transaction** is a group of SQL statements that are treated as a **single unit of work**. Either ALL statements succeed (COMMIT) or ALL are undone (ROLLBACK). There is no partial execution.
+
+### Why Transactions Matter
+Without transactions, a failure between two related operations leaves the database in an **inconsistent state**:
+```
+Transfer $500 from Account A to Account B:
+
+Without transaction:               With transaction:
+  1. Debit A: -$500  ✓              1. START TRANSACTION
+  2. ⚡ APPLICATION CRASHES ⚡       2. Debit A: -$500
+  3. Credit B: never happens!       3. Credit B: +$500
+  Result: $500 disappeared!         4. COMMIT (or ROLLBACK if error)
+                                    Result: Either both or neither
+```
+
+### ACID Properties
+| Property | Meaning | Guarantee |
+|---|---|---|
+| **Atomicity** | All or nothing | Transaction fully completes or fully rolls back |
+| **Consistency** | Valid state only | Database moves from one valid state to another |
+| **Isolation** | No interference | Concurrent transactions don't affect each other |
+| **Durability** | Permanent | Committed data survives crashes |
+
+### Step-by-Step: Transaction Lifecycle
+```
+1. START TRANSACTION  -> Begin a new unit of work
+2. Execute SQL statements (INSERT, UPDATE, DELETE)
+3. If all succeed:  COMMIT   -> Changes written to disk permanently
+4. If any fails:    ROLLBACK -> All changes undone, as if nothing happened
+```
+
+## 9.1 Transaction Syntax
 
 ```sql
 -- Transfer $500 from account 1 to account 2
@@ -1235,6 +1304,29 @@ COMMIT;
 ```
 
 ## 9.3 Isolation Levels
+
+### What Are Isolation Levels?
+Isolation levels define **how much one transaction can see another transaction's uncommitted changes**. Higher isolation = more consistency but lower performance (more locking).
+
+### Why Multiple Isolation Levels Exist
+Full isolation (SERIALIZABLE) is the safest but slowest. Most applications don't need it. Isolation levels let you **trade consistency for performance** based on your use case:
+
+```
+Less Isolation                                    More Isolation
+More Performance                                  Less Performance
++----------------++--------------++---------------++--------------+
+|READ UNCOMMITTED||READ COMMITTED||REPEATABLE READ|| SERIALIZABLE |
++----------------++--------------++---------------++--------------+
+   Never use            Oracle/PG         MySQL default        Financial
+   in production        default                               systems only
+```
+
+### When to Use Each Level
+| Level | Use When |
+|---|---|
+| READ COMMITTED | Most web apps; good balance of performance and consistency |
+| REPEATABLE READ | Default in MySQL; prevents most anomalies |
+| SERIALIZABLE | Financial transactions where absolute consistency is required |
 
 | Level | Dirty Read | Non-Repeatable Read | Phantom Read | Performance |
 |---|---|---|---|---|
@@ -1312,6 +1404,18 @@ WHERE id = 2;   -- WAITS for T2   WHERE id = 1;   -- WAITS for T1
 ---
 
 # Part 10: Query Optimization
+
+### Why Query Optimization Matters
+In production, a single unoptimized query can bring down an entire application. Understanding the EXPLAIN output and optimization techniques is essential for any backend engineer.
+
+### The Optimization Process
+```
+Step 1: Identify slow queries (slow query log or APM tools)
+Step 2: Run EXPLAIN on the query
+Step 3: Analyze the execution plan (scan type, rows, indexes)
+Step 4: Apply optimization (add index, rewrite query, restructure)
+Step 5: Re-run EXPLAIN to verify improvement
+```
 
 ## 10.1 EXPLAIN Command
 
@@ -1426,7 +1530,19 @@ SELECT * FROM customers c WHERE EXISTS (
 
 # Part 11: Real Production Database Scenarios
 
+### Why Production SQL Differs from Textbook SQL
+Production database code must handle:
+- **Concurrent access** -- multiple users hitting the same data simultaneously
+- **Failure recovery** -- transactions, savepoints, error handlers
+- **Performance at scale** -- millions of rows, complex joins, indexes
+- **Data integrity** -- foreign keys, constraints, FOR UPDATE locks
+
+The following stored procedures demonstrate how these concerns are handled in real enterprise systems.
+
 ## 11.1 Order Processing System
+
+### Concept: Atomic Multi-Table Operations
+Placing an order involves multiple tables (orders, order_items, products). All must succeed or all must fail. The stored procedure uses `FOR UPDATE` to lock product rows and prevent overselling.
 
 ```sql
 -- Place an order (transaction ensures atomicity)
@@ -2357,6 +2473,224 @@ public void processData() {
 | Connections | `SHOW GLOBAL STATUS LIKE 'Threads%'` | Max exceeded |
 | Memory | `SHOW VARIABLES LIKE 'innodb_buffer_pool_size'` | Pool too small |
 | Replication lag | `SHOW SLAVE STATUS` | Seconds_Behind_Master |
+
+---
+
+# Part 16: Build It Yourself -- E-Commerce Database
+
+> **Goal:** Design and build a complete e-commerce database from scratch -- schema, indexes, stored procedures, and Spring Boot integration.
+
+## Concept Overview
+
+```
+Tables:  customers -> orders -> order_items -> products
+                              categories <--+
+```
+
+| Table | Purpose | Key Indexes |
+|---|---|---|
+| `customers` | Customer accounts | email (UNIQUE), status |
+| `products` | Product catalog | sku (UNIQUE), category_id + price |
+| `categories` | Product categories | name (UNIQUE) |
+| `orders` | Customer orders | customer_id + created_at, status |
+| `order_items` | Line items per order | order_id, product_id |
+
+---
+
+## Step 1: Create the Database Schema
+
+**Concept:** Design tables with proper data types, constraints, and indexes from the start.
+
+```sql
+CREATE DATABASE ecommerce CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE ecommerce;
+
+-- Customers table
+CREATE TABLE customers (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    first_name VARCHAR(100) NOT NULL,
+    last_name VARCHAR(100) NOT NULL,
+    email VARCHAR(255) NOT NULL UNIQUE,          -- UNIQUE = auto-creates index
+    phone VARCHAR(20),
+    status ENUM('ACTIVE','INACTIVE','BLOCKED') DEFAULT 'ACTIVE',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_customer_status (status)            -- Fast filtering by status
+);
+
+-- Categories table
+CREATE TABLE categories (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL UNIQUE,
+    parent_id INT,
+    FOREIGN KEY (parent_id) REFERENCES categories(id)
+);
+
+-- Products table
+CREATE TABLE products (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    sku VARCHAR(50) NOT NULL UNIQUE,
+    name VARCHAR(200) NOT NULL,
+    category_id INT NOT NULL,
+    price DECIMAL(10,2) NOT NULL,
+    stock_quantity INT DEFAULT 0,
+    status ENUM('ACTIVE','DISCONTINUED') DEFAULT 'ACTIVE',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (category_id) REFERENCES categories(id),
+    INDEX idx_product_category_price (category_id, price)  -- Composite index
+);
+
+-- Orders table
+CREATE TABLE orders (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    customer_id BIGINT NOT NULL,
+    total_amount DECIMAL(12,2) NOT NULL,
+    status ENUM('PENDING','CONFIRMED','SHIPPED','DELIVERED','CANCELLED') DEFAULT 'PENDING',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (customer_id) REFERENCES customers(id),
+    INDEX idx_order_customer_date (customer_id, created_at DESC)
+);
+
+-- Order items table
+CREATE TABLE order_items (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    order_id BIGINT NOT NULL,
+    product_id BIGINT NOT NULL,
+    quantity INT NOT NULL,
+    unit_price DECIMAL(10,2) NOT NULL,
+    line_total DECIMAL(12,2) GENERATED ALWAYS AS (quantity * unit_price) STORED,
+    FOREIGN KEY (order_id) REFERENCES orders(id),
+    FOREIGN KEY (product_id) REFERENCES products(id)
+);
+```
+
+---
+
+## Step 2: Insert Sample Data
+
+```sql
+INSERT INTO categories (name) VALUES ('Electronics'), ('Clothing'), ('Books');
+
+INSERT INTO products (sku, name, category_id, price, stock_quantity) VALUES
+('ELEC-001', 'Wireless Mouse', 1, 29.99, 500),
+('ELEC-002', 'USB-C Hub', 1, 49.99, 200),
+('CLT-001', 'Cotton T-Shirt', 2, 19.99, 1000),
+('BK-001', 'Java Concurrency in Practice', 3, 45.00, 150);
+
+INSERT INTO customers (first_name, last_name, email) VALUES
+('John', 'Doe', 'john@example.com'),
+('Jane', 'Smith', 'jane@example.com');
+```
+
+---
+
+## Step 3: Write Essential Queries
+
+```sql
+-- Top-selling products by revenue
+SELECT p.name, SUM(oi.quantity) AS units_sold, SUM(oi.line_total) AS revenue
+FROM order_items oi
+JOIN products p ON oi.product_id = p.id
+GROUP BY p.id ORDER BY revenue DESC LIMIT 10;
+
+-- Customer order history with totals
+SELECT c.first_name, c.last_name, COUNT(o.id) AS order_count,
+       SUM(o.total_amount) AS total_spent
+FROM customers c
+LEFT JOIN orders o ON c.id = o.customer_id
+GROUP BY c.id ORDER BY total_spent DESC;
+
+-- Low stock alert
+SELECT sku, name, stock_quantity FROM products
+WHERE stock_quantity < 10 AND status = 'ACTIVE';
+```
+
+---
+
+## Step 4: Create a Stored Procedure
+
+```sql
+DELIMITER //
+CREATE PROCEDURE PlaceOrder(
+    IN p_customer_id BIGINT,
+    IN p_product_id BIGINT,
+    IN p_quantity INT,
+    OUT p_order_id BIGINT,
+    OUT p_result VARCHAR(50)
+)
+BEGIN
+    DECLARE v_price DECIMAL(10,2);
+    DECLARE v_stock INT;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        SET p_result = 'ERROR';
+    END;
+
+    START TRANSACTION;
+
+    SELECT price, stock_quantity INTO v_price, v_stock
+    FROM products WHERE id = p_product_id FOR UPDATE;
+
+    IF v_stock < p_quantity THEN
+        SET p_result = 'INSUFFICIENT_STOCK';
+        ROLLBACK;
+    ELSE
+        INSERT INTO orders (customer_id, total_amount, status)
+        VALUES (p_customer_id, v_price * p_quantity, 'CONFIRMED');
+        SET p_order_id = LAST_INSERT_ID();
+
+        INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+        VALUES (p_order_id, p_product_id, p_quantity, v_price);
+
+        UPDATE products SET stock_quantity = stock_quantity - p_quantity
+        WHERE id = p_product_id;
+
+        SET p_result = 'SUCCESS';
+        COMMIT;
+    END IF;
+END //
+DELIMITER ;
+```
+
+---
+
+## Step 5: Call from Spring Boot
+
+```java
+@Repository
+public class OrderProcedureRepository {
+    @PersistenceContext private EntityManager em;
+
+    public OrderResult placeOrder(Long customerId, Long productId, int qty) {
+        StoredProcedureQuery query = em.createStoredProcedureQuery("PlaceOrder")
+            .registerStoredProcedureParameter("p_customer_id", Long.class, ParameterMode.IN)
+            .registerStoredProcedureParameter("p_product_id", Long.class, ParameterMode.IN)
+            .registerStoredProcedureParameter("p_quantity", Integer.class, ParameterMode.IN)
+            .registerStoredProcedureParameter("p_order_id", Long.class, ParameterMode.OUT)
+            .registerStoredProcedureParameter("p_result", String.class, ParameterMode.OUT)
+            .setParameter("p_customer_id", customerId)
+            .setParameter("p_product_id", productId)
+            .setParameter("p_quantity", qty);
+        query.execute();
+        return new OrderResult(
+            (Long) query.getOutputParameterValue("p_order_id"),
+            (String) query.getOutputParameterValue("p_result"));
+    }
+}
+```
+
+---
+
+## Key Takeaways
+
+| Concept | Remember |
+|---|---|
+| Index design | Create indexes on columns used in WHERE, JOIN, ORDER BY |
+| Composite indexes | Order matters: `(customer_id, created_at)` ≠ `(created_at, customer_id)` |
+| `FOR UPDATE` | Locks rows during transaction -- prevents concurrent modification |
+| Stored procedures | Atomic operations that run entirely in the database |
+| `EXPLAIN` | Always check query plans before production deployment |
 
 ---
 

@@ -679,8 +679,44 @@ public class OrderAggregatorService {
 
 ## 5.1 Race Conditions
 
-### What
-A **race condition** occurs when two or more threads access shared data concurrently, and the outcome depends on the unpredictable order of thread execution.
+### What is a Race Condition?
+A **race condition** occurs when two or more threads access shared data concurrently, and the outcome depends on the unpredictable order of thread execution. The program produces different results on different runs because thread scheduling is non-deterministic.
+
+### Why Race Conditions are Dangerous
+Race conditions are among the most dangerous bugs in software because:
+- They are **non-deterministic** — the bug may appear only 1 in 10,000 runs
+- They are **hard to reproduce** — adding logging or debugging often changes thread timing and hides the bug
+- They cause **data corruption** — financial calculations become wrong, inventory goes negative
+- They can lead to **security vulnerabilities** — TOCTOU (Time-of-Check to Time-of-Use) attacks exploit race conditions
+
+### When Race Conditions Occur
+A race condition requires ALL three of these conditions simultaneously:
+1. **Shared mutable state** — multiple threads access the same variable/object
+2. **At least one thread writes** — if all threads only read, there is no race
+3. **No synchronization** — no mechanism prevents concurrent access
+
+> **Key Insight:** If you eliminate ANY ONE of these three conditions, the race condition disappears. This is the foundation of all thread-safety strategies.
+
+### Real-World Production Scenarios
+| Scenario | What Goes Wrong |
+|---|---|
+| Two users buy the last item simultaneously | Inventory goes to -1, both get confirmation |
+| Two threads update the same bank balance | Money appears or disappears |
+| Two services claim the same resource | Double-booking, duplicate processing |
+| Counter incremented by multiple threads | Final count is less than expected |
+
+### Step-by-Step: How a Race Condition Happens
+```
+Thread A                           Thread B
+--------                           --------
+Step 1: Read balance (1000)        
+                                   Step 2: Read balance (1000)  <- stale!
+Step 3: balance = 1000 - 800       
+        balance = 200              Step 4: balance = 1000 - 800
+                                           balance = 200  <- OVERWRITES Thread A's write!
+
+Result: Only $800 deducted instead of $1600. Bank loses $800.
+```
 
 ### Example: The Classic Bank Account Problem
 ```java
@@ -714,18 +750,60 @@ BankAccount account = new BankAccount(); // balance = 1000
 
 ## 5.2 Critical Sections
 
-A **critical section** is a block of code that accesses shared resources and must be executed by only one thread at a time.
+### What is a Critical Section?
+A **critical section** is a block of code that accesses shared resources and must be executed by only one thread at a time. It is the smallest possible region of code that needs protection.
 
+### Why Critical Sections Matter
+The goal is to make the critical section **as small as possible**. Locking too much code reduces concurrency (threads wait longer). Locking too little causes race conditions.
+
+### Design Principle: Minimize Lock Scope
+```
+BAD:  Lock entire method (other threads blocked for everything)
++-----------------------------------------------------+
+|  🔒 LOCKED                                          |
+|  Read config (safe)  ->  Access shared data  ->  Log  |
++-----------------------------------------------------+
+
+GOOD: Lock only the shared data access (other threads blocked minimally)
++--------------+ +-----------------+ +--------------+
+|  Read config | |  🔒 LOCKED       | |  Log         |
+|  (no lock)   | |  Access shared  | |  (no lock)   |
++--------------+ +-----------------+ +--------------+
+```
+
+### Execution Flow
 ```
 Thread A ---> [Enter Critical Section] ---> [Read/Write Shared Data] ---> [Exit]
                       🔒 LOCKED
 Thread B ---> [Waiting...             ] ---------------------------> [Enter] ---> [...]
 ```
 
+---
+
 ## 5.3 The synchronized Keyword
 
-### What
+### What is synchronized?
 The `synchronized` keyword provides **mutual exclusion** (mutex) — only one thread can execute a synchronized block/method at a time for a given lock object.
+
+### Why synchronized Exists
+Java needed a simple, language-level mechanism to protect critical sections. Before `java.util.concurrent` (added in Java 5), `synchronized` was the **only** way to achieve thread safety.
+
+### When to Use synchronized
+| Use synchronized When | Don't Use synchronized When |
+|---|---|
+| Simple mutual exclusion needed | You need tryLock or timeout |
+| Few threads contending | High contention (100+ threads) |
+| Code simplicity matters | You need read/write lock separation |
+| Lock scope is a single method/block | You need to lock across methods |
+
+### Alternatives to synchronized
+| Alternative | When to Use Instead |
+|---|---|
+| `ReentrantLock` | Need tryLock, timeout, fair ordering, multiple conditions |
+| `ReadWriteLock` | Read-heavy workload, few writes |
+| `StampedLock` | Optimistic reads, highest performance |
+| `Atomic*` classes | Simple counters, flags (no locking needed) |
+| `ConcurrentHashMap` | Thread-safe map without external locking |
 
 ### How It Works Internally
 Every Java object has an **intrinsic lock** (also called **monitor**). When a thread enters a synchronized block:
@@ -849,13 +927,40 @@ public class OrderProcessingService {
 
 ## 5.4 Volatile Keyword
 
-### What
+### What is volatile?
 The `volatile` keyword ensures **visibility** of changes across threads. When a variable is declared volatile, reads/writes go directly to main memory (no CPU cache).
 
-### When to Use
+### Why volatile Exists — The JMM Visibility Problem
+Without `volatile`, each thread may work with a **cached copy** of a variable in its CPU cache. Thread A updates a variable, but Thread B never sees the update because it reads its own stale cached copy.
+
+```
+Without volatile:
++--------------+     +--------------+
+|  Thread A    |     |  Thread B    |
+|  CPU Cache   |     |  CPU Cache   |
+|  running=F   |     |  running=T   |  <- STALE! Thread B never sees the update
++------+-------+     +------+-------+
+       |                    |
+   +---+--------------------+---+
+   |     Main Memory            |
+   |     running = false        |
+   +----------------------------+
+
+With volatile:
+  Thread A writes -> goes DIRECTLY to main memory
+  Thread B reads  -> reads DIRECTLY from main memory
+  No caching, always fresh value
+```
+
+### When to Use volatile
 - Simple flags (boolean state): `volatile boolean running = true;`
 - When only **one thread writes** and others read
-- NOT sufficient for compound operations (check-then-act, increment)
+- Status indicators, configuration flags, shutdown signals
+
+### When NOT to Use volatile
+- **Compound operations** (check-then-act, increment) — NOT atomic with volatile
+- When **multiple threads write** to the same variable
+- When you need **mutual exclusion** — volatile provides only visibility, not atomicity
 
 ```java
 public class GracefulShutdown {
@@ -890,8 +995,35 @@ public class GracefulShutdown {
 
 ## 6.1 wait(), notify(), notifyAll()
 
-### What
-These methods on `Object` allow threads to **communicate** about shared state. They must be called from within a `synchronized` block on the same object.
+### What is Inter-Thread Communication?
+Inter-thread communication allows threads to **coordinate** their actions based on shared state. Instead of busy-waiting (spinning in a loop checking a condition), threads can efficiently **sleep** until another thread signals that the condition has changed.
+
+### Why It Exists — The Polling Problem
+Without wait/notify, a thread must continuously check a condition:
+```
+BAD: Busy-waiting (wastes CPU cycles)
+while (!dataAvailable) {
+    // Thread spins, consuming 100% CPU doing nothing useful
+}
+
+GOOD: wait/notify (thread sleeps, zero CPU usage while waiting)
+while (!dataAvailable) {
+    wait();  // Thread sleeps, uses no CPU. Woken up by notify()
+}
+```
+
+### When to Use wait/notify vs Modern Alternatives
+| Approach | Use When |
+|---|---|
+| `wait()/notify()` | Legacy code, learning fundamentals |
+| `Condition` (from `Lock`) | Need multiple wait conditions on one lock |
+| `BlockingQueue` | **Production code** — handles wait/notify internally |
+| `CompletableFuture` | One-time async result passing |
+| `CountDownLatch` | One thread waits for N threads to finish |
+
+> **Best Practice:** In production code, prefer `BlockingQueue` or `CompletableFuture` over raw wait/notify. They handle synchronization internally and are less error-prone.
+
+### How wait/notify Works Internally
 
 | Method | Description |
 |---|---|
@@ -900,12 +1032,49 @@ These methods on `Object` allow threads to **communicate** about shared state. T
 | `notify()` | Wakes up ONE arbitrary waiting thread |
 | `notifyAll()` | Wakes up ALL waiting threads (recommended) |
 
-### Rules
+### Step-by-Step Execution Flow
+```
+1. Thread A calls wait() on object X
+   -> Thread A RELEASES the lock on X
+   -> Thread A enters WAITING state (uses no CPU)
+   -> Thread A is added to X's "wait set"
+
+2. Thread B acquires lock on X, modifies shared state
+   -> Thread B calls notifyAll() on X
+   -> All threads in X's wait set are moved to "entry set"
+   -> Thread B releases lock on X
+
+3. Thread A re-acquires lock on X
+   -> Thread A re-checks condition in while loop
+   -> If condition met: proceeds. If not: calls wait() again
+```
+
+### Critical Rules
 1. Must be called inside `synchronized` block on the **same object**
 2. `wait()` releases the lock; the thread re-acquires it when woken up
 3. Always use `while` loop (not `if`) to check condition — guard against **spurious wakeups**
+4. Prefer `notifyAll()` over `notify()` to avoid lost signals
+
+### Design Pattern: Guarded Suspension
+The wait/notify pattern implements the **Guarded Suspension** design pattern — a thread suspends execution until a guard condition becomes true.
 
 ## 6.2 Producer-Consumer Pattern
+
+### What is the Producer-Consumer Pattern?
+The **Producer-Consumer pattern** decouples data production from data consumption. Producers generate data and place it in a shared buffer. Consumers take data from the buffer and process it. Neither needs to know about the other.
+
+### Why This Pattern is Used
+- **Decoupling** — producers and consumers work independently at different speeds
+- **Buffering** — absorb temporary speed mismatches (producer faster than consumer)
+- **Scalability** — easily add more producers or consumers
+
+### Real-World Examples
+| System | Producer | Buffer | Consumer |
+|---|---|---|---|
+| REST API | HTTP request handler | BlockingQueue | Background worker threads |
+| Kafka | Event publisher | Kafka topic | Consumer group |
+| Batch processing | File reader | In-memory queue | Record processor |
+| Logging | Application thread | Log buffer | Log writer thread |
 
 ```java
 public class MessageQueue<T> {
@@ -1020,10 +1189,45 @@ String msg = queue.take();  // Blocks if empty
 
 # Chapter 7: Locks Framework (java.util.concurrent.locks)
 
+### Why a Separate Locks Framework?
+The `synchronized` keyword was Java's only locking mechanism until Java 5. While simple, it has limitations:
+- Cannot attempt a lock without blocking (no tryLock)
+- Cannot timeout while waiting for a lock
+- Cannot interrupt a thread waiting for a lock
+- Cannot have fairness guarantees
+- Only one wait/notify condition per lock
+
+The `java.util.concurrent.locks` package was introduced in **Java 5** to address all of these limitations while maintaining backward compatibility.
+
 ## 7.1 ReentrantLock
 
-### What
-A **reentrant mutual exclusion lock** with extended capabilities beyond `synchronized`. The same thread can acquire the lock multiple times without deadlocking.
+### What is ReentrantLock?
+A **reentrant mutual exclusion lock** with extended capabilities beyond `synchronized`. The same thread can acquire the lock multiple times without deadlocking (hence "reentrant" — re-entering the same lock).
+
+### Why "Reentrant" Matters
+```
+Scenario: Method A calls Method B, both need the same lock
+
+Non-reentrant lock:     Reentrant lock:
+  methodA() {             methodA() {
+    lock.lock();            lock.lock();       // count = 1
+    methodB();  <- DEADLOCK! methodB();         // works fine
+  }                       }
+  methodB() {             methodB() {
+    lock.lock(); <- blocks   lock.lock();       // count = 2
+    forever!                // ... work ...
+  }                         lock.unlock();     // count = 1
+                          }
+```
+
+### When to Use ReentrantLock vs synchronized
+| Use ReentrantLock When | Stick with synchronized When |
+|---|---|
+| Need tryLock() or lock timeout | Simple mutual exclusion |
+| Need fair lock ordering | Code simplicity matters most |
+| Need multiple Condition objects | Short critical sections |
+| Need interruptible lock waiting | No need for advanced features |
+| Complex locking scenarios | Low contention scenarios |
 
 ### Why Use Over synchronized
 - **tryLock()** — Non-blocking lock attempt
@@ -1031,6 +1235,8 @@ A **reentrant mutual exclusion lock** with extended capabilities beyond `synchro
 - **lockInterruptibly()** — Can be interrupted while waiting
 - **Fairness policy** — Optional FIFO ordering of waiting threads
 - **Multiple Condition objects** — More flexible than wait/notify
+
+> **Production Rule:** Always use `try-finally` with ReentrantLock. If you forget `unlock()` in a `finally` block, threads will deadlock permanently.
 
 ### How It Works
 ```java
@@ -1128,8 +1334,32 @@ public class BoundedBuffer<T> {
 
 ## 7.2 ReadWriteLock
 
-### What
+### What is ReadWriteLock?
 Allows multiple **concurrent readers** OR one **exclusive writer**. Dramatically improves throughput for read-heavy scenarios.
+
+### Why ReadWriteLock Exists
+With `synchronized` or `ReentrantLock`, even read operations block each other. In a system where 95% of operations are reads, this wastes concurrency. ReadWriteLock allows all readers to proceed simultaneously — only writers need exclusive access.
+
+### When to Use ReadWriteLock
+- **Read-heavy workloads** (90%+ reads, few writes)
+- Configuration caches, reference data, lookup tables
+- When reads are significantly more frequent than writes
+
+### When NOT to Use ReadWriteLock
+- **Write-heavy workloads** — overhead of read/write tracking adds no benefit
+- **Short critical sections** — lock overhead may exceed actual work
+- Consider `ConcurrentHashMap` for concurrent map access instead
+
+### Real-World Scenario
+```
+Configuration Cache (1000 reads/sec, 1 write/min):
+
+synchronized:          ReadWriteLock:
+  [R1] [R2] [R3]...     [R1] [R2] [R3]  <- all read simultaneously
+  Each waits for         [R4] [R5]       <- no waiting!
+  the previous one       [W1]            <- only writer blocks
+  Throughput: LOW        Throughput: HIGH
+```
 
 ### How It Works
 ```
@@ -1257,10 +1487,40 @@ public class Point {
 
 # Chapter 8: Java Concurrent Collections
 
+### Why Concurrent Collections Exist
+Before Java 5, the only thread-safe collections were `Vector`, `Hashtable`, and `Collections.synchronizedXxx()` wrappers. These use **coarse-grained locking** — every method synchronizes on the entire collection, creating a bottleneck. Concurrent collections use **fine-grained locking**, **lock-free algorithms (CAS)**, and **copy-on-write** strategies for dramatically better performance.
+
+| Collection Type | Old Thread-Safe | Modern Concurrent | Performance Gain |
+|---|---|---|---|
+| Map | `Hashtable`, `Collections.synchronizedMap()` | `ConcurrentHashMap` | 10-100x under contention |
+| List | `Vector`, `Collections.synchronizedList()` | `CopyOnWriteArrayList` | Lock-free reads |
+| Queue | (none) | `ConcurrentLinkedQueue`, `BlockingQueue` | Non-blocking or efficient blocking |
+
+---
+
 ## 8.1 ConcurrentHashMap
 
-### What
+### What is ConcurrentHashMap?
 A thread-safe HashMap designed for **high concurrency**. Uses per-bucket locking (Java 8+) instead of locking the entire map.
+
+### Why ConcurrentHashMap Over Hashtable/synchronizedMap
+| Feature | `Hashtable` / `synchronizedMap` | `ConcurrentHashMap` |
+|---|---|---|
+| Locking | Entire map locked on every operation | Only affected bucket locked |
+| Read performance | Blocked by any write | Lock-free reads (volatile) |
+| Write performance | All writes sequential | Concurrent writes to different buckets |
+| Null keys/values | `Hashtable`: no nulls; `synchronizedMap`: allows | No nulls (by design) |
+| Iterator | Fail-fast (throws CME) | Weakly consistent (no CME) |
+
+### When to Use ConcurrentHashMap
+- In-memory caches, rate limiters, metrics counters
+- Any map accessed by multiple threads
+- When you need `computeIfAbsent`, `merge`, or other atomic compound operations
+
+### When NOT to Use ConcurrentHashMap
+- Single-threaded code — use `HashMap` (no overhead)
+- Need sorted keys — use `ConcurrentSkipListMap`
+- Need to lock multiple operations atomically — external `synchronized` block needed
 
 ### Internal Architecture (Java 8+)
 ```
@@ -1331,12 +1591,34 @@ long total = metrics.reduceValues(/* parallelismThreshold */ 4,
 
 ## 8.2 CopyOnWriteArrayList
 
-### What
-A thread-safe List where every write operation creates a **new copy** of the underlying array. Read operations are lock-free.
+### What is CopyOnWriteArrayList?
+A thread-safe List where every write operation creates a **new copy** of the underlying array. Read operations are completely lock-free because they read from an immutable snapshot.
+
+### Why Copy-on-Write?
+The fundamental insight is: **if the data never changes in place, reads can never be inconsistent**. By copying the entire array on every write, existing readers continue iterating the old (immutable) array while the new version is prepared.
+
+### How It Works Internally
+```
+State 1: array = [A, B, C]   <- all readers see this
+
+Writer adds D:
+  1. Creates new array: [A, B, C, D]
+  2. Atomically swaps reference: array -> new array
+  3. Old array: readers still iterating it see [A, B, C] — consistent!
+  4. New readers see [A, B, C, D]
+
+No locks needed for reads. Iterator never throws ConcurrentModificationException.
+```
 
 ### When to Use
 - **Read-heavy, write-rare** scenarios (e.g., event listeners, configuration lists)
 - Small-to-medium sized lists
+- When iterator consistency is critical (no ConcurrentModificationException)
+
+### When NOT to Use
+- **Frequent writes** — each write copies the ENTIRE array (O(n) time and memory)
+- **Large lists** — copying a 10,000-element array on every add is expensive
+- Use `ConcurrentLinkedQueue` or `Collections.synchronizedList()` instead for write-heavy scenarios
 
 ```java
 @Component
@@ -1367,8 +1649,20 @@ public class WebhookRegistry {
 
 ## 8.3 BlockingQueue
 
-### What
-A Queue that blocks the thread on `put()` when full and on `take()` when empty. **The go-to data structure for producer-consumer patterns.**
+### What is BlockingQueue?
+A Queue that blocks the thread on `put()` when full and on `take()` when empty. **The go-to data structure for producer-consumer patterns** in production Java applications.
+
+### Why BlockingQueue Over Manual wait/notify
+BlockingQueue encapsulates all the synchronization complexity (wait/notify, while loops, lock management) into a simple `put()` and `take()` API. It eliminates the most common concurrency bugs.
+
+### When to Use Which Implementation
+| If You Need... | Use... | Why |
+|---|---|---|
+| Fixed-size buffer | `ArrayBlockingQueue` | Bounded, predictable memory |
+| Unbounded or large buffer | `LinkedBlockingQueue` | Grows as needed |
+| Priority ordering | `PriorityBlockingQueue` | Always dequeues highest priority |
+| Direct handoff (no buffer) | `SynchronousQueue` | Producer waits for consumer |
+| Delayed processing | `DelayQueue` | Elements available only after delay |
 
 ### Implementations
 
@@ -1486,6 +1780,47 @@ public class EventBuffer {
 
 # Chapter 9: Executor Framework
 
+### What is the Executor Framework?
+The **Executor Framework** (introduced in Java 5, `java.util.concurrent` package) is a higher-level replacement for manually creating and managing threads. It decouples **task submission** from **task execution**, allowing you to focus on WHAT to run, not HOW to run it.
+
+### Why the Executor Framework Exists
+Before Java 5, every concurrent operation required manually creating `Thread` objects. This leads to three critical problems in production:
+
+| Problem | Impact |
+|---|---|
+| **Resource waste** | Each thread costs ~1MB memory + ~1ms creation time |
+| **No bound on concurrency** | 10,000 requests = 10,000 threads = OOM crash |
+| **No task queuing** | When all threads are busy, new tasks are simply lost |
+| **No lifecycle management** | No graceful shutdown, thread leak on exceptions |
+
+### Design Pattern: Thread Pool Pattern
+The Executor Framework implements the **Thread Pool** pattern — a fixed set of worker threads are created once, and tasks are submitted to a queue. Workers pull tasks from the queue and execute them.
+
+```
+Architecture:
+
+Client Code                      Executor Framework
++-------------+              +-------------------------------+
+|  Task 1     | -submit-> |  BlockingQueue         |
+|  Task 2     | -submit-> |  [Task1][Task2][Task3]  |
+|  Task 3     | -submit-> |            |               |
++-------------+              |  Worker-1  <--takes task  |
+                              |  Worker-2  <--takes task  |
+                              |  Worker-3  (idle)        |
+                              +-------------------------------+
+```
+
+### When to Use Executor Framework
+- **Always** use it instead of raw `new Thread()` in production code
+- When you need to bound concurrency (fixed number of threads)
+- When tasks should be queued and processed in order
+- When you need graceful shutdown capabilities
+
+### When NOT to Use
+- Simple one-off background tasks — consider `CompletableFuture.runAsync()` (uses ForkJoinPool internally)
+- Reactive systems — use Project Reactor or RxJava instead
+- If using Spring Boot, prefer `@Async` annotation with a configured `TaskExecutor`
+
 ## 9.1 Why Thread Pools?
 
 Creating raw threads for every task is expensive and dangerous:
@@ -1507,6 +1842,9 @@ Solution: Thread Pools
 
 ## 9.2 ThreadPoolExecutor Architecture
 
+### Understanding the Constructor Parameters
+The `ThreadPoolExecutor` is the core implementation behind all thread pools. Understanding its 7 parameters is essential for production tuning:
+
 ```java
 public ThreadPoolExecutor(
     int corePoolSize,        // Threads always kept alive
@@ -1519,7 +1857,8 @@ public ThreadPoolExecutor(
 )
 ```
 
-### How Tasks Are Dispatched
+### Step-by-Step: How Tasks Are Dispatched
+When you submit a task, the ThreadPoolExecutor follows this exact decision tree:
 ```
 New task arrives:
     |
@@ -1543,6 +1882,17 @@ New task arrives:
 ```
 
 ## 9.3 Thread Pool Types (Executors Factory Methods)
+
+### Choosing the Right Thread Pool Type
+
+| Thread Pool | Core Threads | Max Threads | Queue | Best For |
+|---|---|---|---|---|
+| `FixedThreadPool` | n | n | Unbounded | Predictable, steady workload |
+| `CachedThreadPool` | 0 | ∞ | SynchronousQueue | Bursty, short-lived tasks |
+| `SingleThreadExecutor` | 1 | 1 | Unbounded | Sequential tasks |
+| `ScheduledThreadPool` | n | n | DelayedWorkQueue | Timed/periodic tasks |
+
+> **Production Warning:** Never use `Executors.newFixedThreadPool()` or `newCachedThreadPool()` in production without understanding their dangers. Both can cause OOM — one via unbounded queues, the other via unbounded thread creation. Always create `ThreadPoolExecutor` directly with bounded queues.
 
 ### FixedThreadPool
 ```java
@@ -1666,6 +2016,51 @@ public class ExecutorConfig {
 ## 10.1 What is CompletableFuture?
 
 `CompletableFuture<T>` is a **non-blocking**, **composable**, **chainable** framework for asynchronous programming. It represents a future result that can be completed manually or by a computation.
+
+### Why CompletableFuture Over Future
+The old `Future` interface (Java 5) was very limited:
+
+| Limitation of Future | CompletableFuture Solution |
+|---|---|
+| `get()` blocks the calling thread | `thenApply()`, `thenAccept()` — non-blocking callbacks |
+| Cannot chain operations | `thenCompose()`, `thenCombine()` — fluent chaining |
+| No exception handling | `exceptionally()`, `handle()` — inline error handling |
+| Cannot combine multiple futures | `allOf()`, `anyOf()` — parallel orchestration |
+| No manual completion | `complete()`, `completeExceptionally()` |
+
+### When to Use CompletableFuture
+- Calling multiple microservices in parallel and combining results
+- Non-blocking API responses (reactive-style programming)
+- Any scenario where you need to chain async operations
+
+### When NOT to Use
+- Simple fire-and-forget tasks — use `@Async` in Spring Boot
+- CPU-bound parallel processing on large datasets — use parallel streams or Fork/Join
+- Streaming data processing — use Project Reactor or Kafka Streams
+
+### Step-by-Step Execution Flow
+```
+1. supplyAsync(() -> callServiceA())  -> Task submitted to ForkJoinPool
+2. .thenApply(result -> transform(result))  -> Callback registered (NOT executed yet)
+3. .thenCompose(data -> callServiceB(data))  -> Another async callback registered
+4. .exceptionally(ex -> fallback())  -> Error handler registered
+
+Execution happens ONLY when the pool thread processes Step 1.
+Steps 2-4 are chained as callbacks — they execute automatically when Step 1 completes.
+```
+
+### Design Pattern: Pipeline / Chain of Responsibility
+CompletableFuture implements the **Pipeline pattern** — data flows through a chain of transformations, with each stage potentially asynchronous.
+
+### Key API Mental Model
+| Method | Analogy | Returns |
+|---|---|---|
+| `thenApply()` | `map()` in Streams | `CompletableFuture<U>` |
+| `thenCompose()` | `flatMap()` in Streams | `CompletableFuture<U>` |
+| `thenCombine()` | Joining two parallel paths | `CompletableFuture<V>` |
+| `thenAccept()` | `forEach()` in Streams | `CompletableFuture<Void>` |
+| `allOf()` | `Promise.all()` in JavaScript | `CompletableFuture<Void>` |
+| `anyOf()` | `Promise.race()` in JavaScript | `CompletableFuture<Object>` |
 
 ## 10.2 Creating CompletableFutures
 
@@ -1852,6 +2247,34 @@ public class OrderAggregationService {
 
 The Fork/Join framework (Java 7+) is designed for **divide-and-conquer** parallelism. It breaks a large task into smaller subtasks, executes them in parallel, and combines the results.
 
+### Why Fork/Join Over Regular Thread Pools
+Regular thread pools work well for independent tasks. But when a task needs to **recursively split itself** into subtasks and then **combine results**, a regular thread pool deadlocks — parent tasks block waiting for child results, but child tasks are stuck in the queue.
+
+Fork/Join solves this with the **work-stealing algorithm** — idle threads steal work from busy threads' queues, preventing deadlock and maximizing CPU utilization.
+
+### When to Use Fork/Join
+- **Large array/collection processing** — summing, sorting, searching
+- **Recursive divide-and-conquer** algorithms (merge sort, quicksort)
+- CPU-intensive computations that can be split evenly
+
+### When NOT to Use Fork/Join
+- **IO-bound tasks** — blocked threads waste the pool
+- **Small datasets** — splitting overhead exceeds parallel benefit
+- **Uneven task sizes** — one large subtask blocks everything
+- In most cases, **parallel streams** are simpler and use Fork/Join internally
+
+### Architecture
+```
+ForkJoinPool
+|
++- RecursiveTask<V>  -> returns a value (like Callable)
++- RecursiveAction   -> no return value (like Runnable)
+
+Each worker thread has its own deque (double-ended queue):
+- Takes tasks from the HEAD of its own deque
+- Steals tasks from the TAIL of other threads' deques
+```
+
 ### Core Components
 - **ForkJoinPool** — Specialized thread pool with work-stealing
 - **RecursiveTask\<V\>** — Fork/join task that returns a result
@@ -1959,6 +2382,42 @@ public class FileProcessorAction extends RecursiveAction {
 ---
 
 # Chapter 12: Parallel Streams
+
+### What are Parallel Streams?
+Parallel Streams allow you to process collections using **multiple threads automatically** with a single API change: `.stream()` -> `.parallelStream()`. Under the hood, parallel streams use the **Fork/Join framework** to split, process, and combine data.
+
+### Why Parallel Streams Exist
+Parallel streams make data parallelism accessible without manually managing threads, pools, or synchronization. They are ideal for **data-parallel** operations where the same transformation is applied to every element independently.
+
+### How Parallel Streams Work Internally
+```
+1. The stream source provides a Spliterator
+2. The Spliterator splits the data into roughly equal chunks
+3. Each chunk is wrapped in a ForkJoinTask
+4. Tasks are submitted to ForkJoinPool.commonPool()
+5. Worker threads process chunks independently
+6. Results are combined using the Collector's combiner function
+
+   Source:     [1, 2, 3, 4, 5, 6, 7, 8]
+   Split:      [1,2,3,4]   [5,6,7,8]
+   Split:      [1,2][3,4]  [5,6][7,8]
+   Process:     T-1  T-2    T-3  T-4
+   Combine:       10          26
+   Final:            36
+```
+
+> **Critical Warning:** Parallel streams use `ForkJoinPool.commonPool()`, which is shared by the **entire JVM**. If your parallel stream blocks (e.g., on I/O), it starves ALL other parallel streams in the application.
+
+### Decision Guide: When to Use Parallel Streams
+| Condition | Use Parallel? | Why |
+|---|---|---|
+| Dataset > 100K elements AND CPU-bound | **Yes** | Meaningful speedup |
+| Dataset < 10K elements | **No** | Split/merge overhead > benefit |
+| I/O operations (REST, DB) | **No** | Blocks shared pool |
+| Order-dependent logic | **Caution** | May break ordering |
+| Shared mutable state | **NEVER** | Race conditions |
+| ArrayList source | **Yes** | Good random-access splitting |
+| LinkedList source | **No** | Poor splitting (sequential only) |
 
 ## 12.1 stream() vs parallelStream()
 
@@ -2077,6 +2536,20 @@ customPool.shutdown();
 ## 13.1 What is a Deadlock?
 
 A **deadlock** is a situation where two or more threads are **permanently blocked**, each waiting for a lock held by the other.
+
+### Why Deadlocks Are Critical
+- The application **hangs silently** — no exception is thrown, no error logged
+- Affects only the deadlocked threads initially, but cascades as other threads wait for the same locks
+- In production, deadlocks often appear only under **high load** (when thread timing changes)
+- They are **permanent** — the application will never recover without intervention
+
+### Real-World Production Scenarios
+| Scenario | What Happens |
+|---|---|
+| Money transfer between two accounts | Thread A locks Account-1, Thread B locks Account-2, both wait for the other |
+| Distributed lock across microservices | Service A holds Lock-X, Service B holds Lock-Y, circular dependency |
+| Database row-level locks | Transaction 1 locks Row A, Transaction 2 locks Row B, both try to update the other |
+| Spring bean circular dependency | BeanA depends on BeanB, BeanB depends on BeanA during initialization |
 
 ```
 Thread A holds Lock-1, waiting for Lock-2
@@ -2240,9 +2713,35 @@ public void transfer(Account from, Account to, double amount) {
 
 # Chapter 14: Thread Safety Design Patterns
 
+### Why Thread Safety Patterns Matter
+There are exactly **three strategies** to achieve thread safety. Every pattern falls into one of these categories:
+
+| Strategy | How It Works | Example Patterns |
+|---|---|---|
+| **Don't share state** | Each thread has its own data | ThreadLocal, immutable value objects |
+| **Share immutable state** | Data cannot change after creation | Immutable objects, final fields |
+| **Synchronize access** | Only one thread accesses at a time | synchronized, locks, atomic variables |
+
+> **Architect's Principle:** Always prefer immutability and no-sharing over synchronization. Synchronization is the most error-prone approach.
+
 ## 14.1 Immutable Objects
 
+### What are Immutable Objects?
 Objects whose state **cannot change after construction**. Inherently thread-safe — no synchronization needed.
+
+### Why Use Immutable Objects for Thread Safety
+- **Zero synchronization overhead** — no locks, no volatile, no atomic operations
+- **No race conditions possible** — if the data cannot change, concurrent reads are always safe
+- **Safe to share freely** — pass between threads, store in caches, return from methods
+- **Easier to reason about** — the object you have will never change unexpectedly
+
+### When to Use
+- Configuration objects, DTOs, value objects, keys in maps
+- Any object shared across threads where mutation is not needed
+
+### When NOT to Use
+- Objects that MUST be updated frequently (use AtomicReference or synchronized instead)
+- Very large objects where copying is expensive
 
 ```java
 public final class ImmutableConfig {
@@ -2273,7 +2772,23 @@ public final class ImmutableConfig {
 
 ## 14.2 ThreadLocal
 
+### What is ThreadLocal?
 Each thread gets its **own copy** of a variable. No sharing -> no synchronization needed.
+
+### Why ThreadLocal Exists
+Sometimes you need per-request data (current user, transaction ID, locale) that flows through many method calls. Passing it as a parameter to every method is impractical. ThreadLocal makes it **implicitly available** to any code running on the same thread.
+
+### When to Use
+- Per-request context in web applications (user identity, correlation ID)
+- Database connections (connection-per-thread pattern)
+- `SimpleDateFormat` instances (not thread-safe, ThreadLocal fixes it)
+
+### When NOT to Use
+- **With thread pools** — ThreadLocal values leak between requests unless explicitly cleaned up
+- **With async/reactive code** — tasks may switch threads mid-execution
+- **For sharing data between threads** — ThreadLocal is per-thread, not shared
+
+> **Production Warning:** ALWAYS call `ThreadLocal.remove()` in a `finally` block or interceptor. In thread pools, a thread is reused for the next request — if you don't clean up, the next request sees the previous request's data. This is a **security vulnerability**.
 
 ```java
 public class RequestContext {
@@ -2783,6 +3298,152 @@ CompletableFuture.supplyAsync(() -> {
     return restTemplate.getForObject(url, Data.class);
 }, ioExecutor); // IO pool designed for blocking calls
 ```
+
+---
+
+# Chapter 18: Build It Yourself — Async Order Processing System
+
+> **Goal:** Build a Spring Boot application that processes orders asynchronously using ThreadPool, CompletableFuture, BlockingQueue, and @Async.
+
+## Concept Overview
+
+| Component | Threading Pattern | Why |
+|---|---|---|
+| Order submission | `@Async` | Non-blocking — API returns immediately |
+| Parallel API calls | `CompletableFuture.allOf()` | Call payment + inventory simultaneously |
+| Background queue | `BlockingQueue` + workers | Producer-consumer decoupling |
+| Thread pool | `ThreadPoolTaskExecutor` | Bounded pool prevents exhaustion |
+
+---
+
+## Step 1: Configure Thread Pool
+
+**Concept:** Always use bounded pools in production. Never create raw threads.
+
+```java
+@Configuration
+@EnableAsync
+public class AsyncConfig implements AsyncConfigurer {
+
+    @Override
+    @Bean("orderPool")
+    public Executor getAsyncExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(5);               // 5 threads always alive
+        executor.setMaxPoolSize(20);               // Scale to 20 under load
+        executor.setQueueCapacity(100);            // Max 100 waiting tasks
+        executor.setThreadNamePrefix("order-");    // Named for debugging
+        executor.setRejectedExecutionHandler(
+            new ThreadPoolExecutor.CallerRunsPolicy());  // Backpressure
+        executor.initialize();
+        return executor;
+    }
+}
+```
+
+**Key Takeaways:**
+- `corePoolSize` = threads always alive (even idle)
+- `queueCapacity` = MUST be bounded (prevent OOM)
+- `CallerRunsPolicy` = slows producer when overwhelmed
+
+---
+
+## Step 2: Build Async Order Service
+
+**Concept:** `@Async` runs method in background thread. `CompletableFuture.allOf()` runs multiple calls in parallel.
+
+```java
+@Service
+@RequiredArgsConstructor
+public class OrderService {
+
+    private final PaymentClient paymentClient;
+    private final InventoryClient inventoryClient;
+
+    @Async("orderPool")
+    public CompletableFuture<OrderResult> processOrderAsync(OrderRequest request) {
+        log.info("Processing on thread: {}", Thread.currentThread().getName());
+
+        // PARALLEL calls — 200ms total instead of 400ms sequential
+        CompletableFuture<PaymentResult> payment = CompletableFuture
+            .supplyAsync(() -> paymentClient.charge(request.getPayment()));
+        CompletableFuture<InventoryResult> inventory = CompletableFuture
+            .supplyAsync(() -> inventoryClient.reserve(request.getItems()));
+
+        CompletableFuture.allOf(payment, inventory).join();
+
+        return CompletableFuture.completedFuture(
+            new OrderResult(payment.join().getTxnId(), inventory.join().getReservationId()));
+    }
+}
+```
+
+---
+
+## Step 3: Create Producer-Consumer Queue
+
+**Concept:** BlockingQueue decouples submission from processing. Producers add, consumers process independently.
+
+```java
+@Service
+public class OrderQueueService {
+
+    private final BlockingQueue<OrderRequest> queue =
+        new LinkedBlockingQueue<>(10_000);          // Bounded queue
+
+    public boolean submit(OrderRequest order) {
+        return queue.offer(order);                  // Non-blocking, returns false if full
+    }
+
+    @PostConstruct
+    public void startConsumers() {
+        for (int i = 0; i < 5; i++) {
+            Thread worker = new Thread(() -> {
+                while (!Thread.currentThread().isInterrupted()) {
+                    try {
+                        OrderRequest order = queue.take();   // Blocks until available
+                        processOrder(order);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }, "order-worker-" + i);
+            worker.setDaemon(true);
+            worker.start();
+        }
+    }
+}
+```
+
+---
+
+## Step 4: REST Controller
+
+```java
+@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+
+    @Autowired private OrderService orderService;
+
+    @PostMapping
+    public ResponseEntity<String> submitOrder(@RequestBody OrderRequest request) {
+        orderService.processOrderAsync(request);    // Returns immediately
+        return ResponseEntity.accepted().body("Order submitted");
+    }
+}
+```
+
+---
+
+## Key Takeaways
+
+| Pattern | Use When | Avoid When |
+|---|---|---|
+| `@Async` | Fire-and-forget (emails, logs) | Need result immediately |
+| `CompletableFuture.allOf()` | Parallel independent calls | Sequential dependencies |
+| `BlockingQueue` + consumers | High-throughput processing | Simple one-off tasks |
+| `ThreadPoolTaskExecutor` | Always in production | Never create raw threads |
 
 ---
 

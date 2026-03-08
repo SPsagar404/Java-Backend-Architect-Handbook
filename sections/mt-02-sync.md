@@ -3,8 +3,44 @@
 
 ## 5.1 Race Conditions
 
-### What
-A **race condition** occurs when two or more threads access shared data concurrently, and the outcome depends on the unpredictable order of thread execution.
+### What is a Race Condition?
+A **race condition** occurs when two or more threads access shared data concurrently, and the outcome depends on the unpredictable order of thread execution. The program produces different results on different runs because thread scheduling is non-deterministic.
+
+### Why Race Conditions are Dangerous
+Race conditions are among the most dangerous bugs in software because:
+- They are **non-deterministic** — the bug may appear only 1 in 10,000 runs
+- They are **hard to reproduce** — adding logging or debugging often changes thread timing and hides the bug
+- They cause **data corruption** — financial calculations become wrong, inventory goes negative
+- They can lead to **security vulnerabilities** — TOCTOU (Time-of-Check to Time-of-Use) attacks exploit race conditions
+
+### When Race Conditions Occur
+A race condition requires ALL three of these conditions simultaneously:
+1. **Shared mutable state** — multiple threads access the same variable/object
+2. **At least one thread writes** — if all threads only read, there is no race
+3. **No synchronization** — no mechanism prevents concurrent access
+
+> **Key Insight:** If you eliminate ANY ONE of these three conditions, the race condition disappears. This is the foundation of all thread-safety strategies.
+
+### Real-World Production Scenarios
+| Scenario | What Goes Wrong |
+|---|---|
+| Two users buy the last item simultaneously | Inventory goes to -1, both get confirmation |
+| Two threads update the same bank balance | Money appears or disappears |
+| Two services claim the same resource | Double-booking, duplicate processing |
+| Counter incremented by multiple threads | Final count is less than expected |
+
+### Step-by-Step: How a Race Condition Happens
+```
+Thread A                           Thread B
+--------                           --------
+Step 1: Read balance (1000)        
+                                   Step 2: Read balance (1000)  ← stale!
+Step 3: balance = 1000 - 800       
+        balance = 200              Step 4: balance = 1000 - 800
+                                           balance = 200  ← OVERWRITES Thread A's write!
+
+Result: Only $800 deducted instead of $1600. Bank loses $800.
+```
 
 ### Example: The Classic Bank Account Problem
 ```java
@@ -38,18 +74,60 @@ BankAccount account = new BankAccount(); // balance = 1000
 
 ## 5.2 Critical Sections
 
-A **critical section** is a block of code that accesses shared resources and must be executed by only one thread at a time.
+### What is a Critical Section?
+A **critical section** is a block of code that accesses shared resources and must be executed by only one thread at a time. It is the smallest possible region of code that needs protection.
 
+### Why Critical Sections Matter
+The goal is to make the critical section **as small as possible**. Locking too much code reduces concurrency (threads wait longer). Locking too little causes race conditions.
+
+### Design Principle: Minimize Lock Scope
+```
+BAD:  Lock entire method (other threads blocked for everything)
+┌─────────────────────────────────────────────────────┐
+│  🔒 LOCKED                                          │
+│  Read config (safe)  →  Access shared data  →  Log  │
+└─────────────────────────────────────────────────────┘
+
+GOOD: Lock only the shared data access (other threads blocked minimally)
+┌──────────────┐ ┌─────────────────┐ ┌──────────────┐
+│  Read config │ │  🔒 LOCKED       │ │  Log         │
+│  (no lock)   │ │  Access shared  │ │  (no lock)   │
+└──────────────┘ └─────────────────┘ └──────────────┘
+```
+
+### Execution Flow
 ```
 Thread A ──→ [Enter Critical Section] ──→ [Read/Write Shared Data] ──→ [Exit]
                       🔒 LOCKED
 Thread B ──→ [Waiting...             ] ──────────────────────────→ [Enter] ──→ [...]
 ```
 
+---
+
 ## 5.3 The synchronized Keyword
 
-### What
+### What is synchronized?
 The `synchronized` keyword provides **mutual exclusion** (mutex) — only one thread can execute a synchronized block/method at a time for a given lock object.
+
+### Why synchronized Exists
+Java needed a simple, language-level mechanism to protect critical sections. Before `java.util.concurrent` (added in Java 5), `synchronized` was the **only** way to achieve thread safety.
+
+### When to Use synchronized
+| Use synchronized When | Don't Use synchronized When |
+|---|---|
+| Simple mutual exclusion needed | You need tryLock or timeout |
+| Few threads contending | High contention (100+ threads) |
+| Code simplicity matters | You need read/write lock separation |
+| Lock scope is a single method/block | You need to lock across methods |
+
+### Alternatives to synchronized
+| Alternative | When to Use Instead |
+|---|---|
+| `ReentrantLock` | Need tryLock, timeout, fair ordering, multiple conditions |
+| `ReadWriteLock` | Read-heavy workload, few writes |
+| `StampedLock` | Optimistic reads, highest performance |
+| `Atomic*` classes | Simple counters, flags (no locking needed) |
+| `ConcurrentHashMap` | Thread-safe map without external locking |
 
 ### How It Works Internally
 Every Java object has an **intrinsic lock** (also called **monitor**). When a thread enters a synchronized block:
@@ -173,13 +251,40 @@ public class OrderProcessingService {
 
 ## 5.4 Volatile Keyword
 
-### What
+### What is volatile?
 The `volatile` keyword ensures **visibility** of changes across threads. When a variable is declared volatile, reads/writes go directly to main memory (no CPU cache).
 
-### When to Use
+### Why volatile Exists — The JMM Visibility Problem
+Without `volatile`, each thread may work with a **cached copy** of a variable in its CPU cache. Thread A updates a variable, but Thread B never sees the update because it reads its own stale cached copy.
+
+```
+Without volatile:
+┌──────────────┐     ┌──────────────┐
+│  Thread A    │     │  Thread B    │
+│  CPU Cache   │     │  CPU Cache   │
+│  running=F   │     │  running=T   │  ← STALE! Thread B never sees the update
+└──────┬───────┘     └──────┬───────┘
+       │                    │
+   ┌───┴────────────────────┴───┐
+   │     Main Memory            │
+   │     running = false        │
+   └────────────────────────────┘
+
+With volatile:
+  Thread A writes → goes DIRECTLY to main memory
+  Thread B reads  → reads DIRECTLY from main memory
+  No caching, always fresh value
+```
+
+### When to Use volatile
 - Simple flags (boolean state): `volatile boolean running = true;`
 - When only **one thread writes** and others read
-- NOT sufficient for compound operations (check-then-act, increment)
+- Status indicators, configuration flags, shutdown signals
+
+### When NOT to Use volatile
+- **Compound operations** (check-then-act, increment) — NOT atomic with volatile
+- When **multiple threads write** to the same variable
+- When you need **mutual exclusion** — volatile provides only visibility, not atomicity
 
 ```java
 public class GracefulShutdown {
@@ -214,8 +319,35 @@ public class GracefulShutdown {
 
 ## 6.1 wait(), notify(), notifyAll()
 
-### What
-These methods on `Object` allow threads to **communicate** about shared state. They must be called from within a `synchronized` block on the same object.
+### What is Inter-Thread Communication?
+Inter-thread communication allows threads to **coordinate** their actions based on shared state. Instead of busy-waiting (spinning in a loop checking a condition), threads can efficiently **sleep** until another thread signals that the condition has changed.
+
+### Why It Exists — The Polling Problem
+Without wait/notify, a thread must continuously check a condition:
+```
+BAD: Busy-waiting (wastes CPU cycles)
+while (!dataAvailable) {
+    // Thread spins, consuming 100% CPU doing nothing useful
+}
+
+GOOD: wait/notify (thread sleeps, zero CPU usage while waiting)
+while (!dataAvailable) {
+    wait();  // Thread sleeps, uses no CPU. Woken up by notify()
+}
+```
+
+### When to Use wait/notify vs Modern Alternatives
+| Approach | Use When |
+|---|---|
+| `wait()/notify()` | Legacy code, learning fundamentals |
+| `Condition` (from `Lock`) | Need multiple wait conditions on one lock |
+| `BlockingQueue` | **Production code** — handles wait/notify internally |
+| `CompletableFuture` | One-time async result passing |
+| `CountDownLatch` | One thread waits for N threads to finish |
+
+> **Best Practice:** In production code, prefer `BlockingQueue` or `CompletableFuture` over raw wait/notify. They handle synchronization internally and are less error-prone.
+
+### How wait/notify Works Internally
 
 | Method | Description |
 |---|---|
@@ -224,12 +356,49 @@ These methods on `Object` allow threads to **communicate** about shared state. T
 | `notify()` | Wakes up ONE arbitrary waiting thread |
 | `notifyAll()` | Wakes up ALL waiting threads (recommended) |
 
-### Rules
+### Step-by-Step Execution Flow
+```
+1. Thread A calls wait() on object X
+   → Thread A RELEASES the lock on X
+   → Thread A enters WAITING state (uses no CPU)
+   → Thread A is added to X's "wait set"
+
+2. Thread B acquires lock on X, modifies shared state
+   → Thread B calls notifyAll() on X
+   → All threads in X's wait set are moved to "entry set"
+   → Thread B releases lock on X
+
+3. Thread A re-acquires lock on X
+   → Thread A re-checks condition in while loop
+   → If condition met: proceeds. If not: calls wait() again
+```
+
+### Critical Rules
 1. Must be called inside `synchronized` block on the **same object**
 2. `wait()` releases the lock; the thread re-acquires it when woken up
 3. Always use `while` loop (not `if`) to check condition — guard against **spurious wakeups**
+4. Prefer `notifyAll()` over `notify()` to avoid lost signals
+
+### Design Pattern: Guarded Suspension
+The wait/notify pattern implements the **Guarded Suspension** design pattern — a thread suspends execution until a guard condition becomes true.
 
 ## 6.2 Producer-Consumer Pattern
+
+### What is the Producer-Consumer Pattern?
+The **Producer-Consumer pattern** decouples data production from data consumption. Producers generate data and place it in a shared buffer. Consumers take data from the buffer and process it. Neither needs to know about the other.
+
+### Why This Pattern is Used
+- **Decoupling** — producers and consumers work independently at different speeds
+- **Buffering** — absorb temporary speed mismatches (producer faster than consumer)
+- **Scalability** — easily add more producers or consumers
+
+### Real-World Examples
+| System | Producer | Buffer | Consumer |
+|---|---|---|---|
+| REST API | HTTP request handler | BlockingQueue | Background worker threads |
+| Kafka | Event publisher | Kafka topic | Consumer group |
+| Batch processing | File reader | In-memory queue | Record processor |
+| Logging | Application thread | Log buffer | Log writer thread |
 
 ```java
 public class MessageQueue<T> {
@@ -344,10 +513,45 @@ String msg = queue.take();  // Blocks if empty
 
 # Chapter 7: Locks Framework (java.util.concurrent.locks)
 
+### Why a Separate Locks Framework?
+The `synchronized` keyword was Java's only locking mechanism until Java 5. While simple, it has limitations:
+- Cannot attempt a lock without blocking (no tryLock)
+- Cannot timeout while waiting for a lock
+- Cannot interrupt a thread waiting for a lock
+- Cannot have fairness guarantees
+- Only one wait/notify condition per lock
+
+The `java.util.concurrent.locks` package was introduced in **Java 5** to address all of these limitations while maintaining backward compatibility.
+
 ## 7.1 ReentrantLock
 
-### What
-A **reentrant mutual exclusion lock** with extended capabilities beyond `synchronized`. The same thread can acquire the lock multiple times without deadlocking.
+### What is ReentrantLock?
+A **reentrant mutual exclusion lock** with extended capabilities beyond `synchronized`. The same thread can acquire the lock multiple times without deadlocking (hence "reentrant" — re-entering the same lock).
+
+### Why "Reentrant" Matters
+```
+Scenario: Method A calls Method B, both need the same lock
+
+Non-reentrant lock:     Reentrant lock:
+  methodA() {             methodA() {
+    lock.lock();            lock.lock();       // count = 1
+    methodB();  ← DEADLOCK! methodB();         // works fine
+  }                       }
+  methodB() {             methodB() {
+    lock.lock(); ← blocks   lock.lock();       // count = 2
+    forever!                // ... work ...
+  }                         lock.unlock();     // count = 1
+                          }
+```
+
+### When to Use ReentrantLock vs synchronized
+| Use ReentrantLock When | Stick with synchronized When |
+|---|---|
+| Need tryLock() or lock timeout | Simple mutual exclusion |
+| Need fair lock ordering | Code simplicity matters most |
+| Need multiple Condition objects | Short critical sections |
+| Need interruptible lock waiting | No need for advanced features |
+| Complex locking scenarios | Low contention scenarios |
 
 ### Why Use Over synchronized
 - **tryLock()** — Non-blocking lock attempt
@@ -355,6 +559,8 @@ A **reentrant mutual exclusion lock** with extended capabilities beyond `synchro
 - **lockInterruptibly()** — Can be interrupted while waiting
 - **Fairness policy** — Optional FIFO ordering of waiting threads
 - **Multiple Condition objects** — More flexible than wait/notify
+
+> **Production Rule:** Always use `try-finally` with ReentrantLock. If you forget `unlock()` in a `finally` block, threads will deadlock permanently.
 
 ### How It Works
 ```java
@@ -452,8 +658,32 @@ public class BoundedBuffer<T> {
 
 ## 7.2 ReadWriteLock
 
-### What
+### What is ReadWriteLock?
 Allows multiple **concurrent readers** OR one **exclusive writer**. Dramatically improves throughput for read-heavy scenarios.
+
+### Why ReadWriteLock Exists
+With `synchronized` or `ReentrantLock`, even read operations block each other. In a system where 95% of operations are reads, this wastes concurrency. ReadWriteLock allows all readers to proceed simultaneously — only writers need exclusive access.
+
+### When to Use ReadWriteLock
+- **Read-heavy workloads** (90%+ reads, few writes)
+- Configuration caches, reference data, lookup tables
+- When reads are significantly more frequent than writes
+
+### When NOT to Use ReadWriteLock
+- **Write-heavy workloads** — overhead of read/write tracking adds no benefit
+- **Short critical sections** — lock overhead may exceed actual work
+- Consider `ConcurrentHashMap` for concurrent map access instead
+
+### Real-World Scenario
+```
+Configuration Cache (1000 reads/sec, 1 write/min):
+
+synchronized:          ReadWriteLock:
+  [R1] [R2] [R3]...     [R1] [R2] [R3]  ← all read simultaneously
+  Each waits for         [R4] [R5]       ← no waiting!
+  the previous one       [W1]            ← only writer blocks
+  Throughput: LOW        Throughput: HIGH
+```
 
 ### How It Works
 ```
@@ -581,10 +811,40 @@ public class Point {
 
 # Chapter 8: Java Concurrent Collections
 
+### Why Concurrent Collections Exist
+Before Java 5, the only thread-safe collections were `Vector`, `Hashtable`, and `Collections.synchronizedXxx()` wrappers. These use **coarse-grained locking** — every method synchronizes on the entire collection, creating a bottleneck. Concurrent collections use **fine-grained locking**, **lock-free algorithms (CAS)**, and **copy-on-write** strategies for dramatically better performance.
+
+| Collection Type | Old Thread-Safe | Modern Concurrent | Performance Gain |
+|---|---|---|---|
+| Map | `Hashtable`, `Collections.synchronizedMap()` | `ConcurrentHashMap` | 10-100x under contention |
+| List | `Vector`, `Collections.synchronizedList()` | `CopyOnWriteArrayList` | Lock-free reads |
+| Queue | (none) | `ConcurrentLinkedQueue`, `BlockingQueue` | Non-blocking or efficient blocking |
+
+---
+
 ## 8.1 ConcurrentHashMap
 
-### What
+### What is ConcurrentHashMap?
 A thread-safe HashMap designed for **high concurrency**. Uses per-bucket locking (Java 8+) instead of locking the entire map.
+
+### Why ConcurrentHashMap Over Hashtable/synchronizedMap
+| Feature | `Hashtable` / `synchronizedMap` | `ConcurrentHashMap` |
+|---|---|---|
+| Locking | Entire map locked on every operation | Only affected bucket locked |
+| Read performance | Blocked by any write | Lock-free reads (volatile) |
+| Write performance | All writes sequential | Concurrent writes to different buckets |
+| Null keys/values | `Hashtable`: no nulls; `synchronizedMap`: allows | No nulls (by design) |
+| Iterator | Fail-fast (throws CME) | Weakly consistent (no CME) |
+
+### When to Use ConcurrentHashMap
+- In-memory caches, rate limiters, metrics counters
+- Any map accessed by multiple threads
+- When you need `computeIfAbsent`, `merge`, or other atomic compound operations
+
+### When NOT to Use ConcurrentHashMap
+- Single-threaded code — use `HashMap` (no overhead)
+- Need sorted keys — use `ConcurrentSkipListMap`
+- Need to lock multiple operations atomically — external `synchronized` block needed
 
 ### Internal Architecture (Java 8+)
 ```
@@ -655,12 +915,34 @@ long total = metrics.reduceValues(/* parallelismThreshold */ 4,
 
 ## 8.2 CopyOnWriteArrayList
 
-### What
-A thread-safe List where every write operation creates a **new copy** of the underlying array. Read operations are lock-free.
+### What is CopyOnWriteArrayList?
+A thread-safe List where every write operation creates a **new copy** of the underlying array. Read operations are completely lock-free because they read from an immutable snapshot.
+
+### Why Copy-on-Write?
+The fundamental insight is: **if the data never changes in place, reads can never be inconsistent**. By copying the entire array on every write, existing readers continue iterating the old (immutable) array while the new version is prepared.
+
+### How It Works Internally
+```
+State 1: array = [A, B, C]   ← all readers see this
+
+Writer adds D:
+  1. Creates new array: [A, B, C, D]
+  2. Atomically swaps reference: array → new array
+  3. Old array: readers still iterating it see [A, B, C] — consistent!
+  4. New readers see [A, B, C, D]
+
+No locks needed for reads. Iterator never throws ConcurrentModificationException.
+```
 
 ### When to Use
 - **Read-heavy, write-rare** scenarios (e.g., event listeners, configuration lists)
 - Small-to-medium sized lists
+- When iterator consistency is critical (no ConcurrentModificationException)
+
+### When NOT to Use
+- **Frequent writes** — each write copies the ENTIRE array (O(n) time and memory)
+- **Large lists** — copying a 10,000-element array on every add is expensive
+- Use `ConcurrentLinkedQueue` or `Collections.synchronizedList()` instead for write-heavy scenarios
 
 ```java
 @Component
@@ -691,8 +973,20 @@ public class WebhookRegistry {
 
 ## 8.3 BlockingQueue
 
-### What
-A Queue that blocks the thread on `put()` when full and on `take()` when empty. **The go-to data structure for producer-consumer patterns.**
+### What is BlockingQueue?
+A Queue that blocks the thread on `put()` when full and on `take()` when empty. **The go-to data structure for producer-consumer patterns** in production Java applications.
+
+### Why BlockingQueue Over Manual wait/notify
+BlockingQueue encapsulates all the synchronization complexity (wait/notify, while loops, lock management) into a simple `put()` and `take()` API. It eliminates the most common concurrency bugs.
+
+### When to Use Which Implementation
+| If You Need... | Use... | Why |
+|---|---|---|
+| Fixed-size buffer | `ArrayBlockingQueue` | Bounded, predictable memory |
+| Unbounded or large buffer | `LinkedBlockingQueue` | Grows as needed |
+| Priority ordering | `PriorityBlockingQueue` | Always dequeues highest priority |
+| Direct handoff (no buffer) | `SynchronousQueue` | Producer waits for consumer |
+| Delayed processing | `DelayQueue` | Elements available only after delay |
 
 ### Implementations
 
