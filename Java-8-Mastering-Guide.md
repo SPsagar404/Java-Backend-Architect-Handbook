@@ -405,6 +405,7 @@ long count = names.stream().filter(n -> n.length() > 3).count();
 
 ---
 
+
 # Part 3: Stream Creation Methods
 
 ## 3.1 Collection.stream()
@@ -1445,6 +1446,7 @@ int[] numbers = IntStream.rangeClosed(1, 10).toArray();
 
 ---
 
+
 # Part 6: Collectors Deep Dive
 
 ## 6.1 Collectors.toList()
@@ -2043,6 +2045,7 @@ String[] names = stream.toArray(String[]::new);
 
 ---
 
+
 # Part 9: Comparable vs Comparator (Deep Guide)
 
 ## 9.1 Comparable Interface
@@ -2537,6 +2540,7 @@ public Map<String, Long> analyzeErrors(String logFilePath) throws IOException {
 ```
 
 ---
+
 
 # Part 12: 50+ Coding Interview Problems Using Streams
 
@@ -3479,3 +3483,5 @@ list.stream().filter(predicate).findFirst().orElse(defaultValue);
 ---
 
 *End of Guide -- Mastering Java Streams and Functional Programming*
+
+
