@@ -74,6 +74,27 @@ while (it.hasNext()) {
 }
 ```
 
+### Deep Theory: Spliterator and Parallel Processing
+
+Java 8 added `spliterator()` to enable parallel streams. A Spliterator can split a collection into chunks for concurrent processing:
+
+```java
+// How parallelStream() works internally:
+// 1. collection.spliterator() creates the root Spliterator
+// 2. ForkJoinPool calls trySplit() to divide data
+// 3. Each partition is processed by a separate thread
+// 4. Results are combined
+
+// Custom Spliterator characteristics affect performance:
+// ORDERED -- elements have a defined encounter order (List)
+// DISTINCT -- no two elements are equal (Set)
+// SORTED -- elements are in sorted order (TreeSet)
+// SIZED -- exact size is known (ArrayList)
+// NONNULL -- source guarantees no nulls
+```
+
+**Production Tip:** `ArrayList.spliterator()` supports efficient splitting (divides array in half). `LinkedList.spliterator()` splits poorly (must traverse to find midpoint). This is why parallel streams on `ArrayList` are 2-5x faster than on `LinkedList`.
+
 ---
 
 ## 2.2 Collection\<E\> Interface
@@ -131,6 +152,26 @@ public class NotificationService {
     }
 }
 ```
+
+### Deep Theory: The UnsupportedOperationException Contract
+
+The Collection interface includes methods like `add()`, `remove()`, `clear()`, but NOT all implementations support them. Immutable collections throw `UnsupportedOperationException`:
+
+```java
+List<String> immutable = List.of("A", "B", "C");
+immutable.add("D"); // UnsupportedOperationException!
+
+// This is the "optional operation" pattern in JCF
+// The interface declares the method, but Javadoc marks it as optional
+// Implementation decides whether to support it
+```
+
+**Why this design?** To avoid an explosion of sub-interfaces (ReadableCollection, WritableCollection, etc.). This is a trade-off: compile-time type safety is sacrificed for interface simplicity.
+
+### Interview Question for Chapter 2
+
+**Q: Why does Map not extend Collection?**
+A: Because Map stores key-value pairs, not individual elements. The `add(E e)` method of Collection doesn't make sense for maps (what would you add -- a key? a value? both?). Maps have their own hierarchy with `put(K, V)`, `get(K)`, `entrySet()`, etc.
 
 ---
 
@@ -201,6 +242,24 @@ List<String> copy = List.copyOf(existingList);
 List<String> unmodifiable = List.copyOf(mutableList);
 ```
 
+### Deep Theory: The subList() Trap
+
+`subList()` returns a VIEW of the original list, not a copy. This is both powerful and dangerous:
+
+```java
+List<String> original = new ArrayList<>(List.of("A", "B", "C", "D", "E"));
+List<String> sub = original.subList(1, 4); // [B, C, D] -- VIEW, not copy
+
+sub.set(0, "X"); // original is now [A, X, C, D, E]
+original.add("F"); // DANGER: structurally modifying original
+sub.get(0); // ConcurrentModificationException! subList is invalidated
+
+// SAFE pattern: copy the subList if you need independence
+List<String> safeSub = new ArrayList<>(original.subList(1, 4));
+```
+
+**Production Scenario:** A developer returned `list.subList(0, 10)` from a service method. The caller stored it. Later, the original list was cleared. The subList now threw CME on every access, causing intermittent 500 errors.
+
 ---
 
 ## 2.4 Set\<E\> Interface
@@ -270,6 +329,40 @@ public class DataImportService {
 ### Sub-interfaces
 - **SortedSet\<E\>**: Elements maintained in sorted order. Provides `first()`, `last()`, `headSet()`, `tailSet()`, `subSet()`.
 - **NavigableSet\<E\>** (Java 6+): Extends SortedSet with navigation methods: `lower()`, `floor()`, `ceiling()`, `higher()`, `pollFirst()`, `pollLast()`.
+
+### Deep Theory: Set Algebra in Production
+
+Sets support mathematical set operations that are tremendously useful:
+
+```java
+// UNION: combine two sets
+Set<String> union = new HashSet<>(setA);
+union.addAll(setB);
+
+// INTERSECTION: common elements
+Set<String> intersection = new HashSet<>(setA);
+intersection.retainAll(setB);
+
+// DIFFERENCE: elements in A but not in B
+Set<String> difference = new HashSet<>(setA);
+difference.removeAll(setB);
+
+// SYMMETRIC DIFFERENCE: elements in A or B but not both
+Set<String> symDiff = new HashSet<>(setA);
+symDiff.addAll(setB);
+Set<String> common = new HashSet<>(setA);
+common.retainAll(setB);
+symDiff.removeAll(common);
+```
+
+**Real-World Use Case:** In a permissions system, you compute which permissions were added/removed when a role changes:
+```java
+Set<String> oldPerms = getPermissions(role, oldVersion);
+Set<String> newPerms = getPermissions(role, newVersion);
+Set<String> added = new HashSet<>(newPerms);   added.removeAll(oldPerms);
+Set<String> removed = new HashSet<>(oldPerms); removed.removeAll(newPerms);
+auditLog.record(role, added, removed);
+```
 
 ---
 
@@ -372,6 +465,30 @@ offer(e)   // equivalent to offerLast(e)
 poll()     // equivalent to pollFirst()
 peek()     // equivalent to peekFirst()
 ```
+
+### Deep Theory: Why ArrayDeque is Faster Than LinkedList
+
+```
+Benchmark Results (JMH, 1M operations):
+  ArrayDeque.offer():   ~12 ns/op
+  LinkedList.offer():   ~35 ns/op  (3x slower)
+  
+  ArrayDeque.poll():    ~8 ns/op
+  LinkedList.poll():    ~25 ns/op  (3x slower)
+
+Reasons:
+1. CPU Cache Locality: ArrayDeque stores elements in contiguous array
+   → CPU prefetcher loads adjacent elements into L1 cache
+   LinkedList nodes are scattered across heap → cache misses
+
+2. Memory Overhead: ArrayDeque has zero per-element overhead
+   LinkedList creates a Node object (48 bytes) per element
+
+3. GC Pressure: ArrayDeque creates no garbage on poll()
+   LinkedList creates garbage Node objects for GC to collect
+```
+
+**Rule:** Always use `ArrayDeque` instead of `LinkedList` for Stack/Queue behavior. The only exception is when you need null elements (ArrayDeque forbids nulls).
 
 ### Enterprise Usage
 ```java
@@ -495,5 +612,40 @@ Map<String, Integer> copy = Map.copyOf(existingMap);
 - **SortedMap\<K,V\>**: Keys maintained in sorted order
 - **NavigableMap\<K,V\>**: Extended SortedMap with navigation methods
 - **ConcurrentMap\<K,V\>**: Thread-safe map with atomic operations
+
+### Deep Theory: Java 8 Map Methods Cheat Sheet
+
+| Method | When to Use | Example |
+|---|---|---|
+| `getOrDefault(k, def)` | Avoid null checks | `map.getOrDefault("key", "N/A")` |
+| `putIfAbsent(k, v)` | Insert only if missing | `cache.putIfAbsent(id, loadFromDB())` |
+| `computeIfAbsent(k, fn)` | Lazy compute on miss | `map.computeIfAbsent(key, k -> new ArrayList<>())` |
+| `computeIfPresent(k, fn)` | Update only if exists | `map.computeIfPresent(key, (k,v) -> v + 1)` |
+| `compute(k, fn)` | Insert or update | `map.compute(key, (k,v) -> v == null ? 1 : v + 1)` |
+| `merge(k, v, fn)` | Elegant frequency counting | `map.merge(word, 1, Integer::sum)` |
+| `replaceAll(fn)` | Transform all values | `map.replaceAll((k,v) -> v.toUpperCase())` |
+
+**Production Pattern -- Multi-Value Map:**
+```java
+// Building a Map<String, List<String>> safely
+Map<String, List<String>> multiMap = new HashMap<>();
+multiMap.computeIfAbsent("category", k -> new ArrayList<>()).add("item1");
+multiMap.computeIfAbsent("category", k -> new ArrayList<>()).add("item2");
+// Result: {category=[item1, item2]}
+
+// WRONG approach (NPE if key doesn't exist):
+multiMap.get("category").add("item1"); // NullPointerException!
+```
+
+### Interview Questions for Chapter 2
+
+**Q: What is the difference between offer() and add() in Queue?**
+A: Both insert elements, but `add()` throws `IllegalStateException` if the queue is full (bounded queues), while `offer()` returns `false`. In unbounded queues (LinkedList, ArrayDeque), both behave identically.
+
+**Q: Why does Java recommend Deque over Stack?**
+A: Stack extends Vector (synchronized overhead, bad IS-A relationship). Stack also inherits `add(index, e)` which breaks LIFO semantics. ArrayDeque is faster, not synchronized, and enforces Deque contract properly.
+
+**Q: Why does Map not extend Collection?**
+A: Map stores key-value pairs, not individual elements. Collection's `add(E)` method doesn't fit maps. Map has its own API: `put(K,V)`, `get(K)`, `entrySet()`. However, you can get Collection views: `map.keySet()`, `map.values()`, `map.entrySet()`.
 
 ---

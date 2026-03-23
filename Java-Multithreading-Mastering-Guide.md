@@ -84,6 +84,143 @@ public class Main {
 
 Java's threading model supports **both** through the JVM's thread scheduler and the OS kernel.
 
+### How JVM Maps Java Threads to OS Threads
+
+Since Java 1.2, the HotSpot JVM uses a **1:1 threading model** — every `java.lang.Thread` maps directly to a native OS thread (POSIX thread on Linux, Win32 thread on Windows).
+
+```
+Java World                           OS World
++------------------+                +-------------------+
+|  Thread t1       | ---- JNI --->  |  pthread_create()  |  Linux
+|  Thread t2       | ---- JNI --->  |  CreateThread()    |  Windows
+|  Thread t3       | ---- JNI --->  |  pthread_create()  |  Linux
++------------------+                +-------------------+
+                                         |
+                                    OS Scheduler
+                                    (CFS on Linux)
+                                         |
+                                    +----+----+
+                                    | CPU     |
+                                    | Cores   |
+                                    +---------+
+
+Thread.start() -> native start0() -> JVM_StartThread() -> OS thread created
+```
+
+**What this means in practice:**
+- Java thread scheduling is delegated to the **OS scheduler** (Completely Fair Scheduler on Linux)
+- Java's `Thread.setPriority()` maps to OS priority levels (but mapping varies by OS)
+- Thread context switching is handled at the kernel level
+- Each Java thread consumes a real OS thread, which means you are bounded by OS limits (~30,000 threads per process on most systems)
+
+### CPU Architecture and its Impact on Multithreading
+
+Understanding CPU hardware is critical for writing high-performance concurrent code:
+
+```
+Modern CPU Architecture (8-core, 16-thread CPU):
++------------------------------------------------------+
+|  CPU Package                                          |
+|                                                       |
+|  Core 0          Core 1          Core 2    ...  Core 7|
+|  +----------+   +----------+   +----------+         |
+|  | HT-0 HT-1|   | HT-0 HT-1|   | HT-0 HT-1|         |
+|  | L1 Cache |   | L1 Cache |   | L1 Cache |         |
+|  | (64KB)   |   | (64KB)   |   | (64KB)   |         |
+|  +----+-----+   +----+-----+   +----+-----+         |
+|       |              |              |                 |
+|  +----+--------------+--------------+----+           |
+|  |           L2 Cache (256KB per core)    |           |
+|  +--------------------+------------------+           |
+|                       |                               |
+|  +--------------------+--------------------------+   |
+|  |          L3 Cache (Shared, 16-32MB)            |   |
+|  +-----------------------------------------------+   |
+|                       |                               |
+|  +--------------------+--------------------------+   |
+|  |               Main Memory (RAM)                |   |
+|  +-----------------------------------------------+   |
++------------------------------------------------------+
+
+Key Facts for Java Developers:
+-----------------------------
+- L1 cache access: ~1 ns     (fastest, per-core)
+- L2 cache access: ~4 ns
+- L3 cache access: ~12 ns    (shared across cores)
+- Main memory:     ~100 ns   (100x slower than L1!)
+- Cache line size:  64 bytes  (unit of data transfer between cache and memory)
+
+Why this matters:
+- volatile forces reads/writes through to main memory, bypassing cache
+- false sharing occurs when two threads modify data on the same 64-byte cache line
+- Thread-local data is fast because it stays in L1 cache
+- Hyper-threading shares a core's resources — two HTs on one core are NOT the same as two cores
+```
+
+### Amdahl's Law — The Ceiling of Parallelism
+
+**Amdahl's Law** defines the theoretical maximum speedup from parallelism. No matter how many cores you add, the sequential portion of your code limits the total speedup.
+
+```
+Formula:
+              1
+Speedup = -----------------
+          S + (1 - S) / N
+
+Where:
+  S = fraction of code that is sequential (cannot be parallelized)
+  N = number of processor cores
+
+Example Calculations:
+---------------------
+If 10% of your code is sequential (S = 0.1):
+  4 cores:   1 / (0.1 + 0.9/4)   = 1 / 0.325  = 3.08x speedup
+  8 cores:   1 / (0.1 + 0.9/8)   = 1 / 0.2125 = 4.71x speedup
+  16 cores:  1 / (0.1 + 0.9/16)  = 1 / 0.156  = 6.40x speedup
+  ∞ cores:   1 / 0.1             = 10x speedup  <- MAXIMUM POSSIBLE!
+
+If 50% of your code is sequential (S = 0.5):
+  4 cores:   1 / (0.5 + 0.5/4)   = 1 / 0.625  = 1.6x speedup
+  ∞ cores:   1 / 0.5             = 2x speedup   <- MAXIMUM!
+```
+
+> **Production Insight:** In backend services, the "sequential" portion is often the time spent on shared locks (synchronized blocks). Reducing lock contention has a bigger impact on scalability than adding more cores. This is why `ConcurrentHashMap` (fine-grained locking) is so much faster than `Hashtable` (single global lock).
+
+### Green Threads vs OS Threads vs Virtual Threads
+
+| Feature | Green Threads (JDK 1.0) | OS/Platform Threads (JDK 1.2+) | Virtual Threads (JDK 21+) |
+|---|---|---|---|
+| **Managed by** | JVM | OS kernel | JVM (mounted on carrier threads) |
+| **Memory per thread** | ~KB | ~1 MB (stack) | ~KB (resizable stack) |
+| **Max threads per JVM** | Thousands | ~10,000–30,000 | **Millions** |
+| **Scheduling** | JVM cooperative | OS preemptive | JVM (continuation-based) |
+| **True parallelism** | No (single OS thread) | Yes | Yes (via carrier threads) |
+| **Blocking cost** | Blocks all threads | Blocks one OS thread | Unmounts from carrier, carrier reused |
+| **Use case** | Deprecated | Current standard | Future standard for IO-bound |
+
+```java
+// Platform thread (current standard):
+Thread platformThread = new Thread(() -> doWork());
+platformThread.start(); // Creates OS thread (~1MB memory)
+
+// Virtual thread (Java 21+):
+Thread virtualThread = Thread.ofVirtual().start(() -> doWork());
+// Uses ~few KB, millions can coexist
+
+// Virtual thread executor (Java 21+):
+try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+    for (int i = 0; i < 1_000_000; i++) {
+        executor.submit(() -> {
+            // Each task gets its own virtual thread
+            // Blocking IO automatically unmounts the virtual thread
+            return httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+        });
+    }
+}
+```
+
+> **Senior Engineer Perspective:** Virtual threads (Project Loom) are a game-changer for IO-bound workloads. They eliminate the need for reactive programming frameworks (WebFlux, RxJava) in many scenarios by making blocking calls cheap. However, they do NOT help with CPU-bound tasks — for those, the number of platform threads (= CPU cores) remains the bottleneck.
+
 ---
 
 ## 1.2 Why Multithreading is Needed
@@ -280,6 +417,108 @@ Context Switch Between THREADS (Cheaper):
 // All 200 threads share the same heap (Spring beans, caches, etc.)
 ```
 
+### JVM Per-Thread Memory Layout (Deep Dive)
+
+Each Java thread gets its own dedicated memory regions. Understanding this is essential for diagnosing `StackOverflowError` and tuning memory:
+
+```
+Per-Thread Memory (Private to each thread):
++-----------------------------------------------------+
+|  Thread Stack (default: -Xss512k to -Xss1m)         |
+|  +-------------------------------------------------+|
+|  | Stack Frame: main()                              ||
+|  |   - Local variables: int x = 5                   ||
+|  |   - Operand stack: [5, 10]                       ||
+|  |   - Return address                               ||
+|  +-------------------------------------------------+|
+|  | Stack Frame: processOrder(Order o)               ||
+|  |   - Local variables: Order ref, String s         ||
+|  |   - Operand stack                                ||
+|  +-------------------------------------------------+|
+|  | Stack Frame: validatePayment(Payment p)          ||
+|  |   - (each method call adds a frame)              ||
+|  +-------------------------------------------------+|
+|                                                      |
+|  Program Counter (PC Register)                       |
+|  - Address of current bytecode instruction           |
+|  - Undefined for native methods                      |
+|                                                      |
+|  Native Method Stack                                 |
+|  - For JNI calls (C/C++ code)                        |
+|  - Separate from Java stack                          |
++-----------------------------------------------------+
+
+Memory Calculation for 200 Tomcat threads:
+  Default stack:  512KB x 200 = 100 MB just for thread stacks!
+  With 1MB:       1MB x 200   = 200 MB
+  
+  Production tip: Use -Xss512k for web servers (most methods have 
+  shallow call stacks). Use -Xss1m or more for deep recursion.
+```
+
+### Context Switching: Hidden Performance Killer
+
+Context switching is more expensive than the raw time cost suggests because of **cache pollution**:
+
+```
+What actually happens during a thread context switch:
+------------------------------------------------------
+
+Step 1: Save State (~100 ns)
+  - Save all CPU registers (16 general-purpose + flags + FPU)
+  - Save stack pointer and program counter
+  - Save thread-local storage pointer
+
+Step 2: Scheduler Decision (~200 ns)
+  - OS scheduler picks next thread (CFS on Linux)
+  - Update scheduling statistics
+
+Step 3: Restore State (~100 ns)
+  - Load new thread's registers
+  - Load new thread's stack pointer
+
+Step 4: CACHE WARM-UP (the real cost!! ~1,000-10,000 ns)
+  - New thread accesses different data
+  - L1 cache misses (data for old thread, not new)
+  - L2 cache misses (pipeline stalls)
+  - TLB misses (for process switches)
+  
+Real-world impact:
+  Measured switch cost:  ~1-5 us (direct overhead)
+  Cache pollution cost:  ~5-50 us (indirect, measured by slowdown)
+  
+  At 10,000 context switches/second:
+    Direct cost:   10K x 5us  = 50ms  (5% of one CPU)  
+    Indirect cost: 10K x 25us = 250ms (25% of one CPU!) <- the REAL problem
+
+How to check context switching on Linux:
+  $ vmstat 1          # Look at 'cs' column
+  $ pidstat -w -p PID # Per-process context switches
+```
+
+> **Production Insight:** If your JVM application shows high context switching (`> 50,000/sec`), you likely have too many threads competing for too few cores. The fix is NOT adding more threads — it's reducing thread count, using non-blocking IO, or switching to virtual threads.
+
+### When to Use Processes vs Threads (Senior Decision Framework)
+
+```
+Decision Framework:
+------------------
+
+Use PROCESSES (separate JVMs) when:
+  [Y] Need fault isolation (crash in one service shouldn't kill others)
+  [Y] Different scaling requirements (user service: 4 instances, payment: 2)
+  [Y] Different technology stacks (Java + Python + Go)
+  [Y] Independent deployment lifecycle
+  -> This is why microservices are separate processes
+
+Use THREADS (within one JVM) when:
+  [Y] Need to share memory (caches, connection pools, state)
+  [Y] Communication must be ultra-fast (no serialization, no network)
+  [Y] Tasks are tightly coupled and need consistent view of data
+  [Y] Low-latency requirements (IPC overhead too high)
+  -> This is why web servers use thread pools, not process pools
+```
+
 ---
 
 # Chapter 3: Java Thread Lifecycle
@@ -400,6 +639,108 @@ t.start();
 t.join(); // Wait for completion
 System.out.println(t.getState()); // TERMINATED
 ```
+
+### JVM Internal: How Thread State Transitions Work
+
+At the JVM level, thread state transitions are managed by the **ObjectMonitor** (for synchronized blocks) and **ParkEvent/Parker** (for j.u.c locks):
+
+```
+JVM Internal Thread State Machine:
+----------------------------------
+
+Thread.start() -> JVM calls os::create_thread()
+  -> OS thread created -> state set to RUNNABLE
+  -> OS scheduler picks it up -> run() method executes
+
+Entering synchronized block:
+  -> JVM checks ObjectMonitor owner
+  -> If free: set owner = current thread, enter block (RUNNABLE)
+  -> If owned by other: 
+      1. Spin briefly (adaptive spinning, ~5000 iterations)
+      2. If still locked -> enqueue in ObjectMonitor's _EntryList
+      3. Thread state -> BLOCKED
+      4. OS parks the thread (removes from scheduler)
+
+Object.wait():
+  -> Thread MUST own the monitor (otherwise IllegalMonitorStateException)
+  -> Release monitor (set owner = null)
+  -> Move thread to ObjectMonitor's _WaitSet
+  -> Thread state -> WAITING
+  -> OS parks the thread
+
+Object.notify():
+  -> Pick ONE thread from _WaitSet
+  -> Move it to _EntryList (must re-acquire monitor)
+  -> Woken thread state -> BLOCKED (waiting to re-acquire monitor)
+  -> When monitor acquired -> RUNNABLE
+
+LockSupport.park() / unpark():
+  -> Direct OS-level thread parking
+  -> Used internally by ReentrantLock, CountDownLatch, etc.
+  -> Thread state -> WAITING or TIMED_WAITING
+```
+
+### Reading Thread Dumps: State-Based Diagnostics
+
+Thread dumps (`jstack <PID>`) are the #1 tool for diagnosing production threading issues. Here's how to read each state:
+
+```
+How to take a thread dump:
+--------------------------
+$ jstack <PID>                    # Basic dump
+$ jstack -l <PID>                 # With lock info
+$ jcmd <PID> Thread.print        # Alternative (recommended)
+$ kill -3 <PID>                   # Sends dump to stdout (Linux)
+
+What each state means in a thread dump:
+---------------------------------------
+
+1. RUNNABLE — "java.lang.Thread.State: RUNNABLE"
+   Normal: Thread is doing work (CPU or IO)
+   Problem: If many threads RUNNABLE but CPU is low -> likely doing blocking IO
+            that Java reports as RUNNABLE (e.g., socket read, file IO)
+   
+   "http-nio-8080-exec-1" #25 daemon prio=5 os_prio=0 tid=0x00007f...
+      java.lang.Thread.State: RUNNABLE
+        at java.net.SocketInputStream.read(SocketInputStream.java:152)
+        at com.mysql.cj.protocol.ReadAheadInputStream.read(...)
+   ^ This is actually BLOCKED on network IO, but Java shows it as RUNNABLE
+
+2. BLOCKED — "java.lang.Thread.State: BLOCKED (on object monitor)"
+   Problem: Thread is waiting for a synchronized lock
+   Action:  Find who holds the lock and why they are slow
+   
+   "worker-3" #18 prio=5 os_prio=0 tid=0x00007f...
+      java.lang.Thread.State: BLOCKED (on object monitor)
+        at com.app.service.OrderService.processOrder(OrderService.java:45)
+        - waiting to lock <0x00000000c0035a68> (a java.util.HashMap)
+        - locked by "worker-1" #16
+   ^ worker-3 is blocked because worker-1 holds the lock on HashMap
+
+3. WAITING — "java.lang.Thread.State: WAITING (parking)"
+   Normal: Thread is waiting for work (e.g., thread pool idle)
+   Problem: If many threads WAITING on same condition -> possible deadlock
+   
+   "pool-1-thread-3" #20 prio=5 os_prio=0 tid=0x00007f...
+      java.lang.Thread.State: WAITING (parking)
+        at sun.misc.Unsafe.park(Native Method)
+        at java.util.concurrent.locks.LockSupport.park(LockSupport.java:175)
+        at java.util.concurrent.LinkedBlockingQueue.take(...)
+   ^ Normal: thread pool worker waiting for next task
+
+4. TIMED_WAITING — "java.lang.Thread.State: TIMED_WAITING (sleeping)"
+   Normal: Thread sleeping or waiting with timeout
+   Problem: If business threads are sleeping -> inefficient design
+   
+Quick Diagnosis Cheat Sheet:
+----------------------------
+Many BLOCKED threads    -> Lock contention -> reduce sync scope or use ConcurrentHashMap
+Many WAITING on IO      -> Connection pool exhaustion -> increase pool or add timeouts
+All threads RUNNABLE    -> CPU-bound -> check for infinite loops or heavy computation
+Deadlock detected       -> Fix lock ordering or use tryLock with timeout
+```
+
+> **Senior Engineer Tip:** Take 3 thread dumps 5–10 seconds apart. Compare them. Threads that are stuck in the same state across all 3 dumps are the problem threads. Threads that change state are just doing normal work.
 
 ---
 
@@ -669,9 +1010,181 @@ public class OrderAggregatorService {
 | Chaining | No | No | No | **Yes** |
 | Combining | No | No | Manual | **Yes** (`thenCombine`, `allOf`) |
 | Non-blocking | No | `get()` blocks | `get()` blocks | **Yes** (callbacks) |
-| Production use | ❌ Avoid | ⚠️ Limited | ✅ Good | ✅ **Best** |
+| Production use | [N] Avoid | ⚠️ Limited | [Y] Good | [Y] **Best** |
+
+### Thread.start() Internals: What Actually Happens
+
+When you call `thread.start()`, here is the complete chain of events inside the JVM:
+
+```
+Java code: thread.start()
+    |
+    +--> Thread.start() [Java method]
+    |     - Checks state != NEW -> throws IllegalThreadStateException if already started
+    |     - Adds thread to ThreadGroup
+    |     - Calls native start0()
+    |
+    +--> JVM_StartThread() [C++ code in JVM]
+    |     - Allocates JavaThread object (JVM internal representation)
+    |     - Sets stack size (from -Xss or Thread constructor)
+    |     - Calls os::create_thread()
+    |
+    +--> os::create_thread() [Platform-specific]
+    |     - Linux:   pthread_create(&tid, &attr, thread_native_entry, thread)
+    |     - Windows: CreateThread(NULL, stack_size, thread_native_entry, thread, ...)
+    |     - macOS:   pthread_create() (same as Linux)
+    |
+    +--> thread_native_entry() [C++ callback, runs in NEW OS thread]
+    |     - Initializes thread-local storage
+    |     - Sets thread state to RUNNABLE
+    |     - Calls thread->run() -> JavaThread::run()
+    |
+    +--> JavaThread::run()
+          - Installs signal handlers
+          - Calls Thread.run() [back to Java code!]
+          - When run() returns -> thread cleanup -> state = TERMINATED
+
+Key points:
+  - Thread.start() can ONLY be called once. Calling it again throws
+    IllegalThreadStateException. This is because OS threads cannot be restarted.
+  - You can verify: thread.start(); thread.start(); // throws on second call
+  - This is why thread pools REUSE threads instead of creating new ones.
+```
+
+### Daemon Threads: Deep Understanding
+
+Daemon threads are background service threads that **do not prevent JVM shutdown**. When all non-daemon (user) threads finish, the JVM terminates — killing all daemon threads abruptly.
+
+```java
+// Creating daemon threads
+Thread daemon = new Thread(() -> {
+    while (true) {
+        cleanupExpiredCache();
+        try { Thread.sleep(60000); } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            break;
+        }
+    }
+});
+daemon.setDaemon(true);  // MUST be set BEFORE start()
+daemon.setName("cache-cleanup-daemon");
+daemon.start();
+
+// Daemon thread properties:
+// 1. MUST call setDaemon(true) BEFORE start()
+// 2. Child threads inherit daemon status from parent
+// 3. Daemon threads are killed abruptly — no finally blocks executed!
+// 4. Do NOT use for tasks that require cleanup (file writes, DB commits)
+```
+
+```
+When to use daemon vs non-daemon threads:
+-----------------------------------------
+Daemon threads:                        Non-daemon threads:
+  - GC, monitoring, heartbeats           - Business logic
+  - Cache cleanup                        - File I/O that must complete
+  - Metrics collection                   - Database transactions
+  - Thread pool workers (usually)        - Message processing
+  
+⚠️ In Spring Boot: @Async threads are non-daemon by default.
+   Tomcat worker threads are also non-daemon.
+   Set daemon=true for fire-and-forget background tasks.
+```
+
+### Handling InterruptedException: The Right Way
+
+`InterruptedException` is how Java signals a thread to stop. Handling it correctly is a mark of senior engineering:
+
+```java
+// [N] ANTI-PATTERN 1: Swallowing the interrupt (NEVER DO THIS)
+try {
+    Thread.sleep(1000);
+} catch (InterruptedException e) {
+    // Silently ignored — the thread continues running!
+    // Callers who tried to interrupt this thread are puzzled why it won't stop
+}
+
+// [N] ANTI-PATTERN 2: Just logging and continuing  
+try {
+    Thread.sleep(1000);
+} catch (InterruptedException e) {
+    log.error("Interrupted", e);  // Loses the interrupt flag!
+}
+
+// [Y] CORRECT PATTERN 1: Propagate the exception
+public void doWork() throws InterruptedException {
+    Thread.sleep(1000);  // Let caller handle it
+}
+
+// [Y] CORRECT PATTERN 2: Restore interrupt flag + terminate
+public void run() {
+    while (!Thread.currentThread().isInterrupted()) {
+        try {
+            processNextItem();
+            Thread.sleep(100);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();  // RESTORE the flag!
+            break;                               // Exit the loop
+        }
+    }
+    cleanup();  // Graceful cleanup before thread dies
+}
+
+// [Y] CORRECT PATTERN 3: Convert to unchecked exception
+try {
+    Thread.sleep(1000);
+} catch (InterruptedException e) {
+    Thread.currentThread().interrupt();
+    throw new RuntimeException("Thread was interrupted", e);
+}
+```
+
+> **Why restoring the interrupt flag matters:** When `InterruptedException` is thrown, the interrupt flag is automatically cleared. If you don't restore it with `Thread.currentThread().interrupt()`, higher-level code (like ExecutorService.shutdownNow()) has no way to know the thread was interrupted.
+
+### Thread Creation: Common Anti-Patterns in Production
+
+```java
+// [N] ANTI-PATTERN 1: Creating threads in a loop
+@GetMapping("/api/process")
+public void processRequest() {
+    for (Item item : items) {
+        new Thread(() -> process(item)).start(); // 10,000 items = 10,000 threads = CRASH
+    }
+}
+
+// [Y] FIX: Use ExecutorService with bounded pool
+@Autowired @Qualifier("processingPool")
+private ExecutorService executor;
+
+@GetMapping("/api/process")
+public void processRequest() {
+    items.forEach(item -> executor.submit(() -> process(item)));
+}
+
+// [N] ANTI-PATTERN 2: Not naming threads
+new Thread(() -> doWork()).start();
+// Thread dump shows: "Thread-47" — impossible to debug
+
+// [Y] FIX: Always name threads
+new Thread(() -> doWork(), "order-processor-1").start();
+// Thread dump shows: "order-processor-1" — instantly meaningful
+
+// [N] ANTI-PATTERN 3: Ignoring thread pool shutdown
+@Bean
+public ExecutorService executor() {
+    return Executors.newFixedThreadPool(10);
+    // Never shut down -> threads leak on application context refresh
+}
+
+// [Y] FIX: Graceful shutdown
+@Bean(destroyMethod = "shutdown")
+public ExecutorService executor() {
+    return Executors.newFixedThreadPool(10);
+}
+```
 
 ---
+
 
 
 
@@ -988,6 +1501,295 @@ public class GracefulShutdown {
 | Mutual exclusion | No | Yes |
 | Performance | Faster (no locking) | Slower (lock acquisition) |
 | Use case | Simple flags, single writes | Compound operations |
+
+## 5.5 Java Memory Model (JMM) — Deep Dive
+
+### Why the JMM Exists
+
+The Java Memory Model (JSR-133) defines the rules for how threads interact through memory. Without it, the JIT compiler, CPU, and memory hardware are free to **reorder** and **cache** operations in ways that break multithreaded code.
+
+```
+The Problem Without JMM Guarantees:
+------------------------------------
+
+Java code:              What CPU/compiler might actually do:
+  x = 1;                  y = 2;     <- REORDERED! (faster this way)
+  y = 2;                  x = 1;
+
+This reordering is invisible in single-threaded code (same result).
+But in multithreaded code, Thread B might see y=2 but x=0 (old value)!
+
+Sources of reordering:
+1. Compiler (JIT) reordering — for register optimization
+2. CPU instruction reordering — out-of-order execution pipelines
+3. Store buffer reordering — writes buffered before flushing to cache
+4. Cache coherence delays — different cores see updates at different times
+```
+
+### Happens-Before Relationship
+
+The **happens-before** relationship is the foundation of JMM. If action A *happens-before* action B, then A's effects are **guaranteed visible** to B.
+
+```
+Happens-Before Rules (Memorize These!):
+----------------------------------------
+
+1. PROGRAM ORDER RULE
+   Within a single thread, each statement happens-before the next.
+   x = 1;         <- happens-before ->
+   y = x + 1;     <- guaranteed to see x = 1
+
+2. MONITOR LOCK RULE
+   An unlock() on a monitor happens-before every subsequent lock() on that monitor.
+   Thread A: synchronized(lock) { x = 1; }        <- unlock happens
+   Thread B: synchronized(lock) { print(x); }     <- lock happens -> sees x = 1
+
+3. VOLATILE VARIABLE RULE
+   A write to a volatile variable happens-before every subsequent read of that variable.
+   Thread A: volatile_flag = true;     <- write
+   Thread B: if (volatile_flag) { }    <- read -> guaranteed to see true
+
+4. THREAD START RULE
+   Thread.start() happens-before any action in the started thread.
+   x = 42;
+   thread.start();     <- thread.run() sees x = 42
+
+5. THREAD TERMINATION RULE
+   Any action in a thread happens-before Thread.join() returns.
+   // In thread: x = 42;
+   thread.join();      <- after join, caller sees x = 42
+
+6. TRANSITIVITY
+   If A happens-before B, and B happens-before C, then A happens-before C.
+   This is how volatile can be used to publish non-volatile data safely.
+```
+
+### Memory Barriers (Fences)
+
+Memory barriers are CPU instructions that enforce ordering. The JVM inserts them automatically for `volatile` and `synchronized`:
+
+```
+Types of Memory Barriers:
+-------------------------
+
+LoadLoad   — All reads BEFORE the barrier complete before reads AFTER it
+StoreStore — All writes BEFORE the barrier are flushed before writes AFTER it
+LoadStore  — All reads BEFORE the barrier complete before writes AFTER it
+StoreLoad  — All writes BEFORE the barrier are flushed before reads AFTER it
+             (most expensive, full memory fence)
+
+What the JVM inserts:
+
+volatile READ:
+  [LoadLoad barrier]
+  read volatile variable
+  [LoadStore barrier]
+
+volatile WRITE:
+  [StoreStore barrier]
+  write volatile variable
+  [StoreLoad barrier]    <- this is why volatile writes are expensive
+
+synchronized ENTER:
+  acquire monitor lock
+  [LoadLoad + LoadStore barrier]    <- refresh all cached values
+
+synchronized EXIT:
+  [StoreStore + LoadStore barrier]  <- flush all writes
+  release monitor lock
+```
+
+### The Double-Checked Locking Pattern Explained
+
+This pattern is the classic example of why JMM matters:
+
+```java
+public class ConnectionPool {
+    // WITHOUT volatile: BROKEN!
+    // private static ConnectionPool instance;
+    
+    // WITH volatile: CORRECT
+    private static volatile ConnectionPool instance;
+    
+    public static ConnectionPool getInstance() {
+        if (instance == null) {                    // 1st check (no lock)
+            synchronized (ConnectionPool.class) {
+                if (instance == null) {            // 2nd check (with lock)
+                    instance = new ConnectionPool(); // <- THE PROBLEM
+                }
+            }
+        }
+        return instance;
+    }
+}
+
+// Why volatile is required:
+// "instance = new ConnectionPool()" is actually 3 steps:
+//   1. Allocate memory for ConnectionPool object
+//   2. Initialize the object (constructor runs)
+//   3. Assign reference to 'instance' variable
+//
+// Without volatile, the CPU may REORDER steps 2 and 3:
+//   1. Allocate memory
+//   3. Assign reference (instance now non-null!)  <- REORDERED!
+//   2. Initialize object (constructor hasn't run yet!)
+//
+// Thread B sees instance != null, returns a PARTIALLY CONSTRUCTED object!
+// volatile prevents this reordering with a StoreStore barrier.
+```
+
+## 5.6 False Sharing — The Hidden Performance Killer
+
+### What is False Sharing?
+
+False sharing occurs when two threads on different cores modify **different variables** that happen to reside on the **same CPU cache line** (64 bytes). Both cores constantly invalidate each other's cache lines, destroying performance.
+
+```
+False Sharing Scenario:
+-----------------------
+
+class Counters {
+    volatile long counterA = 0;  // Thread 1 writes this
+    volatile long counterB = 0;  // Thread 2 writes this
+}
+
+Memory layout (both fit in ONE 64-byte cache line):
++----------------------------------------------------------------+
+|  Cache Line (64 bytes)                                         |
+|  [counterA: 8 bytes] [counterB: 8 bytes] [padding: 48 bytes]  |
++----------------------------------------------------------------+
+
+Core 0 (Thread 1)              Core 1 (Thread 2)
+  writes counterA                writes counterB
+  -> invalidates Core 1's         -> invalidates Core 0's
+    cache line!                     cache line!
+  -> Core 1 must reload           -> Core 0 must reload
+    from L3/memory                  from L3/memory
+
+Result: 10-100x slower than expected!
+Each "independent" write causes a full cache line transfer (~100ns)
+instead of an L1 cache hit (~1ns).
+```
+
+### How to Fix False Sharing
+
+```java
+// Solution 1: @Contended annotation (Java 8+, -XX:-RestrictContended)
+import sun.misc.Contended;
+
+class Counters {
+    @Contended
+    volatile long counterA = 0;   // Padded to its own cache line
+    
+    @Contended
+    volatile long counterB = 0;   // Padded to its own cache line
+}
+
+// Solution 2: Manual padding
+class Counters {
+    volatile long counterA = 0;
+    long p1, p2, p3, p4, p5, p6, p7;  // 56 bytes of padding
+    volatile long counterB = 0;
+    // Now counterA and counterB are on DIFFERENT cache lines
+}
+
+// Real-world example: LongAdder uses @Contended internally
+// on its Cell[] array to avoid false sharing between cells
+```
+
+> **Production Insight:** False sharing is why `LongAdder` is faster than `AtomicLong` under high contention. `LongAdder` spreads updates across multiple cache-line-padded cells, so different threads don't invalidate each other's cache lines.
+
+## 5.7 Atomic Classes — Lock-Free Thread Safety
+
+### The CAS (Compare-And-Swap) Hardware Instruction
+
+All Atomic classes are built on top of **CAS** — an atomic CPU instruction that enables lock-free programming:
+
+```
+CAS(memoryLocation, expectedValue, newValue):
+  Atomically:
+    if (memoryLocation == expectedValue) {
+        memoryLocation = newValue;
+        return true;   // Success
+    } else {
+        return false;  // Someone else changed it first, try again
+    }
+
+CPU instruction: CMPXCHG on x86, LL/SC on ARM
+
+How AtomicInteger.incrementAndGet() works internally:
+  1. Read current value (e.g., 5)
+  2. Compute new value (5 + 1 = 6)
+  3. CAS(address, 5, 6) 
+     -> If current is still 5: set to 6, return true [Y]
+     -> If current is now 7 (another thread changed it): return false [N]
+  4. If CAS failed: RETRY from step 1 (spin loop)
+```
+
+### Atomic Classes Overview
+
+```java
+// AtomicInteger / AtomicLong — atomic int/long operations
+AtomicInteger counter = new AtomicInteger(0);
+counter.incrementAndGet();                      // Thread-safe ++
+counter.compareAndSet(expected, newValue);       // CAS
+counter.getAndUpdate(x -> x * 2);               // Atomic function application
+counter.accumulateAndGet(5, Integer::sum);       // Atomic accumulation
+
+// AtomicBoolean — atomic flag
+AtomicBoolean initialized = new AtomicBoolean(false);
+if (initialized.compareAndSet(false, true)) {
+    // Only ONE thread enters here — guaranteed
+    performInitialization();
+}
+
+// AtomicReference<V> — atomic reference swap
+AtomicReference<Config> configRef = new AtomicReference<>(loadConfig());
+// Atomically update config (lock-free)
+configRef.updateAndGet(old -> loadNewConfig());
+
+// AtomicStampedReference<V> — solves the ABA problem
+AtomicStampedReference<String> ref = new AtomicStampedReference<>("A", 0);
+int[] stampHolder = new int[1];
+String value = ref.get(stampHolder);   // Gets value AND stamp
+ref.compareAndSet("A", "B", stampHolder[0], stampHolder[0] + 1);
+```
+
+### LongAdder vs AtomicLong (Critical for High-Contention Counters)
+
+```java
+// AtomicLong: ONE variable, ALL threads CAS on it -> contention bottleneck
+AtomicLong atomicCounter = new AtomicLong(0);
+atomicCounter.incrementAndGet();  // Under 100 threads: LOTS of CAS retries
+
+// LongAdder: MULTIPLE cells, threads spread across cells -> minimal contention
+LongAdder adderCounter = new LongAdder();
+adderCounter.increment();         // Under 100 threads: each thread hits different cell
+long total = adderCounter.sum();  // Sum all cells (slightly stale, but fast)
+```
+
+```
+Performance comparison (100 threads, 1M increments each):
+---------------------------------------------------------
+AtomicLong:    ~3,200 ms  (all threads fighting over one CAS)
+LongAdder:     ~380 ms   (threads spread across padded cells)
+synchronized:  ~4,500 ms  (lock acquisition overhead)
+
+When to use which:
+  AtomicLong  -> low contention, need exact real-time value
+  LongAdder   -> high contention, can tolerate slightly stale sum()
+  LongAccumulator -> high contention, custom accumulation function
+```
+
+### Atomic vs Volatile vs Synchronized Decision Table
+
+| Requirement | Use | Why |
+|---|---|---|
+| Simple flag (one writer, many readers) | `volatile` | Cheapest visibility guarantee |
+| Counter (multiple writers) | `AtomicInteger` / `LongAdder` | Lock-free, no blocking |
+| Check-then-act (compare-and-swap) | `AtomicReference.CAS()` | Single atomic operation |
+| Multiple fields must be consistent | `synchronized` / `ReentrantLock` | Only way to group operations |
+| High-contention counter | `LongAdder` | Distributes contention across cells |
 
 ---
 
@@ -1483,6 +2285,280 @@ public class Point {
 | Performance | Good | Good | Better (reads) | **Best** (reads) |
 | Complexity | Low | Medium | Medium | High |
 
+## 7.4 AbstractQueuedSynchronizer (AQS) — The Backbone
+
+Almost every synchronization utility in `java.util.concurrent` is built on top of **AQS**: ReentrantLock, Semaphore, CountDownLatch, ReentrantReadWriteLock, and more.
+
+```
+AQS Internal Structure:
+------------------------
+
++--------------------------------------------------+
+|  AbstractQueuedSynchronizer                       |
+|                                                   |
+|  state: int (volatile)                            |
+|    - ReentrantLock: 0 = unlocked, N = lock count  |
+|    - Semaphore: number of permits remaining        |
+|    - CountDownLatch: count remaining               |
+|                                                   |
+|  CLH Wait Queue (FIFO):                           |
+|  +------+    +------+    +------+                 |
+|  |Head  | ->  |Node 1| ->  |Node 2| -> null          |
+|  |(dummy)|    |(T1)  |    |(T2)  |                 |
+|  +------+    +------+    +------+                 |
+|               Thread 1    Thread 2                 |
+|               WAITING     WAITING                  |
+|                                                   |
+|  exclusiveOwnerThread: Thread                     |
+|    - Which thread currently owns the lock          |
++--------------------------------------------------+
+
+How ReentrantLock.lock() works internally:
+  1. Try CAS(state, 0, 1) — fast path (no contention)
+     -> Success: set exclusiveOwnerThread = currentThread, return
+  2. If CAS fails: is currentThread == owner? (reentrant check)
+     -> Yes: state++ (increment hold count), return
+  3. Otherwise: create CLH Node, add to queue tail (CAS)
+     -> Park thread using LockSupport.park()
+     -> When unparked: retry acquisition from queue head
+```
+
+> **Interview Gold:** When asked "how does ReentrantLock work internally?", explain the AQS state variable, CLH queue, and the fast-path CAS acquisition. This demonstrates deep JVM knowledge.
+
+## 7.5 Synchronization Utilities
+
+### CountDownLatch — Wait for N Events
+
+**Use case:** Main thread waits for multiple worker threads to complete initialization.
+
+```java
+// Production scenario: Service startup — wait for all caches to warm up
+@Component
+public class ApplicationStartup {
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void onStartup() throws InterruptedException {
+        CountDownLatch latch = new CountDownLatch(3);  // Wait for 3 tasks
+        
+        executor.submit(() -> {
+            loadUserCache();        // Takes ~2 seconds
+            latch.countDown();      // 3 -> 2
+        });
+        executor.submit(() -> {
+            loadProductCatalog();   // Takes ~3 seconds
+            latch.countDown();      // 2 -> 1
+        });
+        executor.submit(() -> {
+            warmUpConnectionPool(); // Takes ~1 second
+            latch.countDown();      // 1 -> 0
+        });
+        
+        boolean completed = latch.await(30, TimeUnit.SECONDS);  // Wait for all 3
+        if (!completed) {
+            throw new IllegalStateException("Startup timed out!");
+        }
+        log.info("All caches warmed. Application ready to serve traffic.");
+    }
+}
+```
+
+```
+CountDownLatch internals (backed by AQS):
+  state = N (initial count)
+  countDown() -> decrementAndGet(state)
+  await()     -> if state > 0, park thread
+  When state reaches 0 -> unpark ALL waiting threads
+
+Key properties:
+  - ONE-TIME USE — cannot be reset (use CyclicBarrier for reusable)
+  - Multiple threads can await() on the same latch
+  - countDown() can be called by different threads
+```
+
+### CyclicBarrier — Synchronize N Threads at a Barrier Point
+
+**Use case:** Multiple threads must all reach a checkpoint before any can proceed (common in iterative algorithms).
+
+```java
+// Production scenario: Parallel data processing with merge step
+public class ParallelReportGenerator {
+
+    public Report generateReport(List<DataSource> sources) throws Exception {
+        int parties = sources.size();
+        List<PartialReport> results = Collections.synchronizedList(new ArrayList<>());
+        
+        // Barrier action runs when ALL threads arrive
+        CyclicBarrier barrier = new CyclicBarrier(parties, () -> {
+            log.info("All {} partitions processed. Merging results...", parties);
+        });
+        
+        for (DataSource source : sources) {
+            executor.submit(() -> {
+                try {
+                    PartialReport partial = processDataSource(source);
+                    results.add(partial);
+                    barrier.await(60, TimeUnit.SECONDS);  // Wait for all threads
+                } catch (Exception e) {
+                    log.error("Partition failed", e);
+                }
+            });
+        }
+        
+        return mergeReports(results);
+    }
+}
+```
+
+```
+CyclicBarrier vs CountDownLatch:
+---------------------------------
+                    CountDownLatch        CyclicBarrier
+  Reusable?         No (one-time)         Yes (reset after trip)
+  Who waits?        Any thread            Only the participating threads
+  Who counts down?  Any thread            The waiting threads themselves
+  Barrier action?   No                    Yes (Runnable at trip point)
+  Use case          "Wait for N events"   "All N threads synchronize"
+```
+
+### Semaphore — Control Concurrent Access to a Resource
+
+**Use case:** Limit the number of concurrent connections, API calls, or resource accesses.
+
+```java
+// Production scenario: Rate-limiting external API calls
+@Service
+public class ExternalApiClient {
+    
+    // Only 10 concurrent API calls allowed (rate limit from provider)
+    private final Semaphore semaphore = new Semaphore(10);
+    
+    public ApiResponse callExternalApi(ApiRequest request) {
+        try {
+            semaphore.acquire();                   // Block if 10 calls in progress
+            try {
+                return restTemplate.postForObject(API_URL, request, ApiResponse.class);
+            } finally {
+                semaphore.release();               // Release permit
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted waiting for API permit", e);
+        }
+    }
+    
+    // Non-blocking alternative
+    public Optional<ApiResponse> tryCallApi(ApiRequest request) {
+        if (semaphore.tryAcquire()) {             // Don't block, return Optional.empty
+            try {
+                return Optional.of(restTemplate.postForObject(API_URL, request, ApiResponse.class));
+            } finally {
+                semaphore.release();
+            }
+        }
+        return Optional.empty();                   // API at capacity
+    }
+}
+```
+
+```
+Semaphore internals (backed by AQS):
+  state = N (number of permits)
+  acquire() -> if state > 0: CAS(state, state-1), proceed
+              if state == 0: park thread in CLH queue
+  release() -> CAS(state, state+1), unpark one waiting thread
+
+Binary Semaphore (permits=1) vs ReentrantLock:
+  - Semaphore is NOT reentrant — same thread acquiring twice will deadlock!
+  - Semaphore has no "owner" — any thread can release()
+  - Use Semaphore for "resource pool" semantics, ReentrantLock for "mutual exclusion"
+```
+
+### Phaser — Dynamic Multi-Phase Synchronization
+
+**Use case:** When the number of participating threads may change dynamically, or when processing has multiple phases.
+
+```java
+// Production scenario: Multi-phase ETL pipeline
+public class EtlPipeline {
+    
+    public void runPipeline(List<DataFile> files) {
+        Phaser phaser = new Phaser(1);  // Register self as coordinator
+        
+        for (DataFile file : files) {
+            phaser.register();  // Dynamically register each worker
+            executor.submit(() -> {
+                try {
+                    // Phase 0: Extract
+                    RawData data = extract(file);
+                    phaser.arriveAndAwaitAdvance();  // Wait for all extractions
+                    
+                    // Phase 1: Transform
+                    TransformedData transformed = transform(data);
+                    phaser.arriveAndAwaitAdvance();  // Wait for all transformations
+                    
+                    // Phase 2: Load
+                    load(transformed);
+                    phaser.arriveAndDeregister();    // Done, deregister
+                } catch (Exception e) {
+                    phaser.arriveAndDeregister();    // Deregister on failure too
+                }
+            });
+        }
+        
+        phaser.arriveAndDeregister();  // Coordinator deregisters
+    }
+}
+```
+
+### Synchronization Utilities Summary
+
+| Utility | Purpose | Reusable | Typical Use Case |
+|---|---|---|---|
+| `CountDownLatch` | Wait for N events | No | Startup initialization |
+| `CyclicBarrier` | Synchronize N threads at a point | Yes | Iterative parallel algorithms |
+| `Semaphore` | Limit concurrent access | Yes | Connection pools, rate limiting |
+| `Phaser` | Dynamic multi-phase sync | Yes | Multi-phase processing pipelines |
+| `Exchanger` | Two threads swap data | Yes | Pipeline stage handoffs |
+
+## 7.6 JIT Lock Optimizations
+
+The JIT compiler (HotSpot C2) automatically optimizes locking when it can prove it's safe:
+
+```
+Lock Coarsening:
+----------------
+JIT combines adjacent synchronized blocks on the same object:
+
+Before optimization:            After optimization:
+  synchronized(lock) { a++; }     synchronized(lock) {
+  synchronized(lock) { b++; }       a++;
+  synchronized(lock) { c++; }       b++;
+                                    c++;
+                                  }
+Result: 3 lock/unlock pairs -> 1 lock/unlock pair
+
+Lock Elision (Biased Locking):
+------------------------------
+JIT detects locks that can never be contended (escape analysis):
+
+  void method() {
+      StringBuilder sb = new StringBuilder();  // Thread-local object
+      sb.append("Hello");                       // sb never escapes this method
+      sb.append(" World");                      // sb.append is synchronized internally
+      return sb.toString();
+  }
+  
+  JIT eliminates ALL synchronization on sb because it proves
+  sb never escapes to another thread. Zero-cost locking!
+
+Lock Striping (Manual technique):
+---------------------------------
+Split one lock into N locks, each protecting 1/N of the data:
+  Before: ONE lock for entire HashMap -> all threads contend
+  After:  16 locks, each for a range of buckets -> 16x less contention
+  This is exactly what ConcurrentHashMap does internally.
+```
+
 ---
 
 # Chapter 8: Java Concurrent Collections
@@ -1774,7 +2850,148 @@ public class EventBuffer {
 | `ConcurrentLinkedQueue` | CAS (lock-free) | No | High-throughput non-blocking |
 | `SynchronousQueue` | Direct handoff | Yes | Thread-to-thread handoff |
 
+## 8.5 ConcurrentHashMap Internals (Java 8+)
+
+Understanding the internal structure helps you know *why* it's so fast and when to expect limitations:
+
+```
+ConcurrentHashMap Internal Structure (Java 8+):
+------------------------------------------------
+
+Table (Node[] array):
++------+------+------+------+------+------+------+------+
+| Bin 0| Bin 1| Bin 2| Bin 3| Bin 4| Bin 5| Bin 6| Bin 7|
++--+---+------+--+---+------+------+------+--+---+------+
+   |             |                            |
+   v             v                            v
+  [K=A,V=1]    [K=C,V=3]                   [K=F,V=6]
+   |             |                            |
+   v             v                            v
+  [K=B,V=2]    [K=D,V=4]                   [K=G,V=7]
+   |                                          |
+   v                                          v
+  null                              * TREEIFIED (TreeNode)
+                                      if > 8 entries per bin!
+
+Java 8 Changes from Java 7:
+---------------------------
+Java 7: Segment-based locking (16 fixed segments)
+Java 8: Per-bin locking with CAS + synchronized on the head node
+
+Put operation flow:
+  1. Compute hash -> find bin index
+  2. If bin is empty -> CAS to insert head node (no lock!)
+  3. If bin is not empty -> synchronized(headNode) {
+       - Traverse linked list / tree
+       - Insert new node or update value
+     }
+  4. If bin size > 8 (TREEIFY_THRESHOLD) -> convert linked list to Red-Black Tree
+  5. If bin size < 6 (UNTREEIFY_THRESHOLD) -> convert back to linked list
+
+Get operation (LOCK-FREE!):
+  1. Compute hash -> find bin
+  2. Traverse chain/tree using volatile reads
+  3. No locking at all — reads are always lock-free
+```
+
+### ConcurrentHashMap Pitfalls
+
+```java
+// [N] PITFALL 1: Non-atomic check-then-act
+if (!map.containsKey(key)) {       // Thread A checks: not present
+    map.put(key, computeValue());  // Thread B inserts between check and put!
+}
+
+// [Y] FIX: Use atomic operations
+map.putIfAbsent(key, computeValue());              // Atomic
+map.computeIfAbsent(key, k -> computeValue());     // Atomic, lazy computation
+
+// [N] PITFALL 2: Size is NOT exact (weakly consistent)
+int size = map.size();  // May be stale during concurrent modifications
+
+// [N] PITFALL 3: Null keys/values not allowed (by design)
+map.put(null, "value");    // NullPointerException!
+map.put("key", null);      // NullPointerException!
+// Reason: null is used internally as a sentinel for absent values
+
+// [Y] BEST PRACTICE: Use compute methods for atomic read-modify-write
+map.compute(key, (k, v) -> v == null ? 1 : v + 1);  // Atomic increment
+map.merge(key, 1, Integer::sum);                      // Atomic merge
+```
+
+## 8.6 ConcurrentSkipListMap / ConcurrentSkipListSet
+
+A **sorted**, thread-safe map implementation using skip lists instead of trees. Provides O(log n) operations with good concurrency.
+
+```
+Skip List Structure:
+--------------------
+
+Level 2:  HEAD -----------------------> 15 -----------> NULL
+             |                          |
+Level 1:  HEAD -----> 5 -----------> 15 -----> 25 ---> NULL
+             |       |              |        |
+Level 0:  HEAD -> 3 -> 5 -> 8 -> 12 -> 15 -> 25 -> 30 -> NULL
+
+Properties:
+  - Lock-free reads (CAS-based updates)
+  - O(log n) get, put, remove
+  - SORTED order (unlike ConcurrentHashMap)
+  - Supports range queries: subMap(), headMap(), tailMap()
+  - NavigableMap interface (ceiling, floor, higher, lower)
+```
+
+```java
+// When to use ConcurrentSkipListMap vs ConcurrentHashMap:
+ConcurrentHashMap<String, Integer> hashMap;     // O(1) get/put, UNSORTED
+ConcurrentSkipListMap<String, Integer> skipMap; // O(log n) get/put, SORTED
+
+// Use ConcurrentSkipListMap when you need:
+//   - Sorted iteration (by key order)
+//   - Range queries (subMap, headMap, tailMap)
+//   - NavigableMap operations (ceilingKey, floorKey)
+//   - Concurrent sorted set (ConcurrentSkipListSet)
+
+// Production example: Time-series data with range queries
+ConcurrentSkipListMap<Instant, Metric> timeSeries = new ConcurrentSkipListMap<>();
+timeSeries.put(Instant.now(), new Metric("cpu", 85.2));
+
+// Get all metrics from last 5 minutes (efficient range query!)
+NavigableMap<Instant, Metric> recent = timeSeries.tailMap(
+    Instant.now().minus(Duration.ofMinutes(5)), true);
+```
+
+## 8.7 Choosing the Right Concurrent Collection
+
+```
+Decision Flowchart:
+-------------------
+
+Need a Map?
+  +- Need sorted keys? -> ConcurrentSkipListMap
+  +- Don't need sorting? -> ConcurrentHashMap (always)
+
+Need a List?
+  +- Read-heavy, small list, rare writes? -> CopyOnWriteArrayList
+  +- Write-heavy or large list? -> Use ConcurrentHashMap or synchronize manually
+
+Need a Queue?
+  +- Need blocking (producer-consumer)?
+  |   +- Need bounded capacity? -> ArrayBlockingQueue
+  |   +- Need priority ordering? -> PriorityBlockingQueue
+  |   +- Need direct handoff (no buffer)? -> SynchronousQueue
+  |   +- General purpose? -> LinkedBlockingQueue
+  +- Non-blocking?
+      +- ConcurrentLinkedQueue
+
+Need a Set?
+  +- Need sorted? -> ConcurrentSkipListSet
+  +- Unordered? -> ConcurrentHashMap.newKeySet()
+      (or Collections.newSetFromMap(new ConcurrentHashMap<>()))
+```
+
 ---
+
 
 
 
@@ -2009,6 +3226,110 @@ public class ExecutorConfig {
 | **Mixed** | `cores x (1 + wait_time/compute_time)` | Balance CPU usage |
 | **Web server** | `100-400` (Tomcat default: 200) | Most time waiting on DB/network |
 
+### Rejection Policies — What Happens When Pool and Queue Are Full
+
+```
+All 4 Built-in Rejection Policies:
+----------------------------------
+
+1. AbortPolicy (DEFAULT)
+   -> Throws RejectedExecutionException
+   -> Use when: task loss is unacceptable, caller must know about failure
+   -> Problem: can crash caller if not caught
+
+2. CallerRunsPolicy
+   -> The submitting thread runs the task itself
+   -> Use when: natural backpressure is desired
+   -> Effect: slows down the caller, prevents task loss
+   -> * RECOMMENDED for most production systems
+
+3. DiscardPolicy
+   -> Silently drops the task
+   -> Use when: task is expendable (metrics, analytics)
+   -> Problem: silent data loss — hard to debug
+
+4. DiscardOldestPolicy
+   -> Drops the oldest task in the queue, retries current task
+   -> Use when: latest data matters most (real-time updates)
+   -> Problem: may discard important long-waiting tasks
+```
+
+```java
+// Custom rejection handler for production (log + metrics)
+public class MonitoredRejectionPolicy implements RejectedExecutionHandler {
+    private final LongAdder rejectedCount = new LongAdder();
+    
+    @Override
+    public void rejectedExecution(Runnable r, ThreadPoolExecutor executor) {
+        rejectedCount.increment();
+        log.warn("Task rejected! Pool: {} active, Queue: {} pending",
+            executor.getActiveCount(), executor.getQueue().size());
+        
+        if (!executor.isShutdown()) {
+            // CallerRunsPolicy as fallback — natural backpressure
+            r.run();
+        }
+    }
+    
+    public long getRejectedCount() { return rejectedCount.sum(); }
+}
+```
+
+### Thread Pool Monitoring with Micrometer (Production Essential)
+
+```java
+@Configuration
+public class ThreadPoolMetrics {
+
+    @Bean
+    public MeterBinder threadPoolMetrics(@Qualifier("ioExecutor") ThreadPoolExecutor pool) {
+        return registry -> {
+            Gauge.builder("threadpool.active", pool, ThreadPoolExecutor::getActiveCount)
+                 .tag("pool", "io").register(registry);
+            Gauge.builder("threadpool.queue.size", pool, e -> e.getQueue().size())
+                 .tag("pool", "io").register(registry);
+            Gauge.builder("threadpool.pool.size", pool, ThreadPoolExecutor::getPoolSize)
+                 .tag("pool", "io").register(registry);
+            FunctionCounter.builder("threadpool.completed", pool,
+                 ThreadPoolExecutor::getCompletedTaskCount)
+                 .tag("pool", "io").register(registry);
+        };
+    }
+}
+
+// Key Alerts to Set:
+// +- queue.size > 80% of capacity -> pool exhaustion approaching
+// +- active == maxPoolSize for > 1 min -> pool fully loaded
+// +- rejected count increasing -> pool is undersized or has a leak
+// +- completed task rate dropping -> possible deadlock or slow tasks
+```
+
+### Virtual Threads (Java 21+) and the Future of Executors
+
+```java
+// Traditional thread pool for IO:
+ExecutorService ioPool = Executors.newFixedThreadPool(200);  // 200 OS threads
+
+// Virtual thread executor (Java 21+):
+ExecutorService virtualPool = Executors.newVirtualThreadPerTaskExecutor();
+// Creates a NEW virtual thread for EACH task — millions possible
+// No need to size the pool — virtual threads are cheap (~KB each)
+
+// Spring Boot 3.2+ with virtual threads:
+// application.properties:
+//   spring.threads.virtual.enabled=true
+// All Tomcat threads + @Async threads become virtual threads automatically!
+```
+
+```
+When to switch to virtual threads:
+  [Y] IO-bound workloads (REST calls, DB queries, file IO)
+  [Y] High-concurrency servers (>1000 concurrent requests)
+  [N] CPU-bound workloads (still need platform thread pools)
+  [N] Code using synchronized heavily (virtual threads pin to carrier)
+     -> Migrate synchronized -> ReentrantLock before using virtual threads
+```
+
 ---
 
 # Chapter 10: CompletableFuture (Java 8+)
@@ -2239,6 +3560,63 @@ public class OrderAggregationService {
 }
 ```
 
+### CompletableFuture Timeout Handling (Java 9+)
+
+```java
+// orTimeout — throws TimeoutException if not completed within duration
+CompletableFuture<ApiResponse> response = CompletableFuture
+    .supplyAsync(() -> callSlowApi(), ioExecutor)
+    .orTimeout(5, TimeUnit.SECONDS);  // Throws TimeoutException after 5s
+
+// completeOnTimeout — provides a default value on timeout
+CompletableFuture<ApiResponse> response = CompletableFuture
+    .supplyAsync(() -> callSlowApi(), ioExecutor)
+    .completeOnTimeout(ApiResponse.defaultValue(), 5, TimeUnit.SECONDS);
+
+// Production pattern: timeout + fallback + logging
+CompletableFuture<UserProfile> profile = CompletableFuture
+    .supplyAsync(() -> userService.getProfile(userId), ioExecutor)
+    .completeOnTimeout(UserProfile.anonymous(), 3, TimeUnit.SECONDS)
+    .whenComplete((result, ex) -> {
+        if (ex != null) {
+            log.warn("Profile fetch failed for user {}: {}", userId, ex.getMessage());
+            metrics.counter("profile.fetch.failure").increment();
+        }
+    });
+```
+
+### CompletableFuture Anti-Patterns
+
+```java
+// [N] ANTI-PATTERN 1: Using join()/get() inside a CompletableFuture chain
+CompletableFuture.supplyAsync(() -> {
+    String result = otherFuture.join();  // BLOCKS the ForkJoinPool thread!
+    return process(result);
+});
+// FIX: Use thenCompose() to chain dependent futures
+
+// [N] ANTI-PATTERN 2: Using common pool for IO-bound tasks
+CompletableFuture.supplyAsync(() -> dbQuery());  // Blocks FJP common pool!
+// FIX: Always pass custom executor for IO tasks
+CompletableFuture.supplyAsync(() -> dbQuery(), ioExecutor);
+
+// [N] ANTI-PATTERN 3: Ignoring exceptions
+CompletableFuture.supplyAsync(() -> riskyOperation())
+    .thenApply(r -> transform(r));  // Exception is silently swallowed!
+// FIX: Always add exception handling
+    .exceptionally(ex -> {
+        log.error("Operation failed", ex);
+        return fallbackValue();
+    });
+
+// [N] ANTI-PATTERN 4: Not understanding *Async variants
+thenApply(fn)       // Runs fn on SAME thread that completed the previous stage
+thenApplyAsync(fn)  // Runs fn on ForkJoinPool.commonPool()
+thenApplyAsync(fn, executor)  // Runs fn on custom executor <- PREFER THIS
+// In production, always use the *Async variant with a custom executor
+// to avoid unpredictable thread behavior
+```
+
 ---
 
 # Chapter 11: Fork/Join Framework
@@ -2461,7 +3839,7 @@ Data:  [1, 2, 3, 4, 5, 6, 7, 8]
 
 ## 12.3 When to Use Parallel Streams
 
-### ✅ Good Candidates
+### [Y] Good Candidates
 ```java
 // 1. CPU-heavy computation on large datasets
 List<Double> results = largeDataset.parallelStream()
@@ -2474,7 +3852,7 @@ long total = sales.parallelStream()
     .sum();
 ```
 
-### ❌ When NOT to Use
+### [N] When NOT to Use
 ```java
 // 1. Small datasets — overhead > benefit
 List<String> small = List.of("a", "b", "c");
@@ -2526,6 +3904,138 @@ customPool.shutdown();
 | Shared mutable state | **No** | Race conditions |
 | ArrayList source | **Yes** | Good spliterator (random access) |
 | LinkedList source | **No** | Poor spliterator (sequential access) |
+
+### The NxQ Model for Parallel Stream Decisions
+
+Doug Lea (creator of `java.util.concurrent`) proposed the **NxQ > 10,000** rule:
+
+```
+N = number of elements
+Q = cost of each operation (in CPU cycles)
+
+Use parallel stream ONLY when N x Q > 10,000
+
+Examples:
+  10 elements x filter (Q=10)     = 100        -> SEQUENTIAL
+  1,000 elements x sort (Q=100)   = 100,000    -> PARALLEL [Y]
+  100,000 elements x map (Q=5)    = 500,000    -> PARALLEL [Y]
+  50 elements x ML inference (Q=10,000) = 500K  -> PARALLEL [Y]
+
+How to estimate Q:
+  - Simple filter/map: Q ~= 1-10
+  - String operations: Q ~= 10-100
+  - Parsing/serialization: Q ~= 100-1,000
+  - Complex computations: Q ~= 1,000-100,000
+```
+
+### Source Data Structure Spliterator Quality
+
+```
+Data Source Spliterator Quality (affects parallel stream performance):
+---------------------------------------------------------------------
+
+Excellent spliterators (split evenly, random access):
+  - ArrayList, arrays -> split in O(1) at midpoint
+  - IntStream.range()  -> split in O(1)
+  - TreeMap, HashSet   -> reasonable splitting
+
+Poor spliterators (sequential access only):
+  - LinkedList         -> must traverse to find midpoint O(n)
+  - Stream.iterate()   -> cannot split at all (processes sequentially)
+  - BufferedReader.lines() -> poor splitting
+  - Custom Iterators   -> depends on implementation
+
+If you have a custom data source:
+  Implement your own Spliterator for optimal parallel performance.
+```
+
+```java
+// Custom Spliterator example for a time-series database
+public class TimeSeriesSpliterator implements Spliterator<DataPoint> {
+    private final DataPoint[] data;
+    private int current;
+    private int end;
+    
+    @Override
+    public Spliterator<DataPoint> trySplit() {
+        int mid = (current + end) >>> 1;  // Split in half
+        if (mid == current) return null;  // Too small to split
+        TimeSeriesSpliterator prefix = new TimeSeriesSpliterator(data, current, mid);
+        current = mid;
+        return prefix;
+    }
+    
+    @Override
+    public long estimateSize() { return end - current; }
+    
+    @Override
+    public int characteristics() {
+        return SIZED | SUBSIZED | ORDERED | NONNULL | IMMUTABLE;
+    }
+    
+    @Override
+    public boolean tryAdvance(Consumer<? super DataPoint> action) {
+        if (current < end) {
+            action.accept(data[current++]);
+            return true;
+        }
+        return false;
+    }
+}
+
+// Usage: create a parallel stream from custom spliterator
+Stream<DataPoint> parallelTimeSeries = StreamSupport.stream(
+    new TimeSeriesSpliterator(data, 0, data.length), true  // true = parallel
+);
+```
+
+### Fork/Join: Threshold Selection Guidelines
+
+Choosing the right threshold (when to stop splitting and process sequentially) is critical for Fork/Join performance:
+
+```
+Threshold Selection Rules of Thumb:
+-----------------------------------
+
+1. Start with: threshold = N / (parallelism x 4)
+   where N = total elements, parallelism = available cores
+   Example: 1,000,000 elements on 8 cores -> threshold ~= 31,250
+
+2. Benchmark with different thresholds:
+   Too high:  not enough parallelism (few tasks, some cores idle)
+   Too low:   too many tasks (overhead of forking exceeds computation)
+   Sweet spot: tasks take 100us to 10ms each
+
+3. Consider the cost of your computation:
+   Cheap operations (sum, filter): threshold = 10,000 - 100,000
+   Expensive operations (crypto, ML): threshold = 10 - 100
+
+4. ManagedBlocker for blocking inside ForkJoinPool:
+   If your task MUST block (e.g., waiting for IO), use ManagedBlocker
+   to tell the pool to create a compensation thread.
+```
+
+```java
+// ManagedBlocker: safely block inside ForkJoinPool
+ForkJoinPool.managedBlock(new ForkJoinPool.ManagedBlocker() {
+    private boolean done = false;
+    
+    @Override
+    public boolean block() throws InterruptedException {
+        // This blocks — but ForkJoinPool knows and can compensate
+        result = blockingApiCall();
+        done = true;
+        return true;
+    }
+    
+    @Override
+    public boolean isReleasable() {
+        return done;
+    }
+});
+// ForkJoinPool creates a temporary compensation thread so other
+// tasks don't starve while this task blocks.
+```
 
 ---
 
@@ -2707,6 +4217,102 @@ public void transfer(Account from, Account to, double amount) {
         transferLock.unlock();
     }
 }
+```
+
+## 13.6 Livelock — The Invisible Deadlock
+
+A **livelock** is when threads keep responding to each other but make **no progress**. Unlike a deadlock (threads are frozen), a livelock has threads actively running but doing useless work.
+
+```java
+// Real-world analogy: Two people in a hallway keep stepping aside for each other
+// Both are "active" but neither makes progress
+
+// Code Example: Livelock in a transfer system
+public boolean transfer(Account from, Account to, BigDecimal amount) {
+    while (true) {
+        if (from.getLock().tryLock()) {
+            try {
+                if (to.getLock().tryLock()) {
+                    try {
+                        from.debit(amount);
+                        to.credit(amount);
+                        return true;
+                    } finally {
+                        to.getLock().unlock();
+                    }
+                }
+            } finally {
+                from.getLock().unlock();
+            }
+        }
+        // Both threads reach here simultaneously, retry, clash again = LIVELOCK!
+    }
+}
+
+// FIX: Add random backoff
+if (!to.getLock().tryLock()) {
+    from.getLock().unlock();
+    Thread.sleep(ThreadLocalRandom.current().nextInt(1, 10));  // Random backoff
+}
+```
+
+```
+Deadlock vs Livelock vs Starvation:
+------------------------------------
+  Deadlock:    Threads FROZEN, waiting for each other
+               -> CPU idle, detected by jstack/ThreadMXBean
+  
+  Livelock:    Threads ACTIVE, but doing useless work repeatedly
+               -> CPU busy, harder to detect (looks like working!)
+  
+  Starvation:  Thread never gets CPU time or lock access
+               -> Usually caused by unfair locks + high-priority threads
+               -> Fix: use fair locks (new ReentrantLock(true))
+```
+
+## 13.7 Thread Leak Detection
+
+A **thread leak** is when threads are created but never properly terminated. Over time, the JVM runs out of OS threads and crashes.
+
+```java
+// Common causes of thread leaks:
+// 1. ExecutorService never shut down
+// 2. Daemon threads with infinite loops and no interrupt check
+// 3. Thread pools created inside methods (new pool per request!)
+
+// Detection: Monitor thread count over time
+@Scheduled(fixedRate = 60000)
+public void detectThreadLeak() {
+    int threadCount = Thread.activeCount();
+    log.info("Active threads: {}", threadCount);
+    
+    if (threadCount > 500) {
+        log.error("THREAD LEAK DETECTED! {} active threads", threadCount);
+        // Take thread dump for analysis
+        ThreadMXBean bean = ManagementFactory.getThreadMXBean();
+        ThreadInfo[] infos = bean.dumpAllThreads(true, true);
+        for (ThreadInfo info : infos) {
+            log.error(info.toString());
+        }
+    }
+}
+```
+
+### Deadlock Prevention Checklist (Code Review)
+
+```
+Code Review Checklist for Lock Safety:
+----------------------------------------
+[ ] Do all locks have a consistent global ordering?
+[ ] Are all lock acquisitions wrapped in try-finally with unlock()?
+[ ] Are there timeouts on all lock acquisitions (tryLock with timeout)?
+[ ] Are nested locks minimized or eliminated?
+[ ] Are external calls (REST, DB) made outside of lock scope?
+[ ] Are thread pools properly shut down in @PreDestroy?
+[ ] Are ThreadLocal values cleaned up with remove()?
+[ ] Are all executors using bounded queues?
+[ ] Is there monitoring for active threads and queue depth?
+[ ] Are InterruptedExceptions handled properly (not swallowed)?
 ```
 
 ---
@@ -2956,6 +4562,125 @@ public class GuardedQueue<T> {
         }
     }
 }
+```
+
+## 14.6 Immutability with Java Records (Java 16+)
+
+Java Records provide the most concise way to create immutable data carriers:
+
+```java
+// Before Records: verbose immutable class
+public final class OrderEvent {
+    private final String orderId;
+    private final BigDecimal amount;
+    private final Instant timestamp;
+    
+    public OrderEvent(String orderId, BigDecimal amount, Instant timestamp) {
+        this.orderId = orderId;
+        this.amount = amount;
+        this.timestamp = timestamp;
+    }
+    // + getters, equals, hashCode, toString (50+ lines)
+}
+
+// With Records: inherently immutable, thread-safe by design
+public record OrderEvent(
+    String orderId,
+    BigDecimal amount,
+    Instant timestamp
+) {
+    // Compact constructor for validation:
+    public OrderEvent {
+        Objects.requireNonNull(orderId, "orderId must not be null");
+        if (amount.compareTo(BigDecimal.ZERO) < 0)
+            throw new IllegalArgumentException("amount must be >= 0");
+    }
+}
+
+// Thread-safe by design:
+// - All fields are final (immutable)
+// - No setters (state can't change)
+// - Can be freely shared between threads without synchronization
+// - Perfect for event objects, DTOs, and message payloads
+```
+
+## 14.7 Lock-Free State Management with AtomicReference
+
+```java
+// Pattern: Atomic configuration updates without locks
+public class DynamicConfig {
+    
+    // Immutable config record
+    public record AppConfig(int maxRetries, Duration timeout, boolean featureFlag) {}
+    
+    private final AtomicReference<AppConfig> config;
+    
+    public DynamicConfig(AppConfig initialConfig) {
+        this.config = new AtomicReference<>(initialConfig);
+    }
+    
+    // Thread-safe read (no lock needed)
+    public AppConfig getConfig() {
+        return config.get();  // Volatile read
+    }
+    
+    // Thread-safe update (CAS, no lock needed)
+    public void updateTimeout(Duration newTimeout) {
+        config.updateAndGet(current -> 
+            new AppConfig(current.maxRetries(), newTimeout, current.featureFlag()));
+    }
+    
+    // Thread-safe conditional update
+    public boolean enableFeature() {
+        return config.compareAndSet(
+            config.get(),  // expected
+            new AppConfig(config.get().maxRetries(), config.get().timeout(), true)
+        );
+    }
+}
+
+// This pattern is used by:
+//  - Spring Cloud Config refresh
+//  - Feature flag systems (LaunchDarkly, Unleash)
+//  - Dynamic routing tables
+```
+
+## 14.8 Thread-Safe Builder Pattern
+
+```java
+// Builder pattern is inherently thread-safe when used correctly:
+// The builder itself is NOT shared — each thread creates its own builder
+// The built object is immutable — safe to share across threads
+
+public record HttpRequest(
+    String url, String method, Map<String, String> headers, byte[] body
+) {
+    public static Builder builder() { return new Builder(); }
+    
+    public static class Builder {
+        private String url;
+        private String method = "GET";
+        private final Map<String, String> headers = new HashMap<>();
+        private byte[] body;
+        
+        public Builder url(String url) { this.url = url; return this; }
+        public Builder method(String method) { this.method = method; return this; }
+        public Builder header(String k, String v) { headers.put(k, v); return this; }
+        public Builder body(byte[] body) { this.body = body; return this; }
+        
+        public HttpRequest build() {
+            return new HttpRequest(
+                url, method,
+                Collections.unmodifiableMap(new HashMap<>(headers)),  // Defensive copy!
+                body != null ? body.clone() : null  // Defensive copy!
+            );
+        }
+    }
+}
+
+// Thread-safety guarantee:
+// Builder is created and used by a SINGLE thread (no sharing needed)
+// HttpRequest record is immutable (safe to share across any threads)
 ```
 
 ---
@@ -3221,6 +4946,84 @@ WebClient.create(url)
    -> active threads, queue size, rejected tasks, completion time
 ```
 
+## 16.4 Reactive Programming vs Multithreading
+
+```
+Comparison: When to Use Which
+--------------------------------
+
+                      Traditional Multithreading    Reactive (WebFlux/RxJava)
+ Thread per request:  1 thread = 1 request           1 thread = 1000s of requests
+ Memory usage:        ~1MB per thread (stack)         ~KB per subscription
+ Blocking IO:         Thread sleeps during IO         Event loop continues
+ Programming model:   Imperative (familiar)           Declarative (learning curve)
+ Debugging:           Stack traces are clear           Stack traces are cryptic
+ Error handling:      try-catch (familiar)             onError operators
+ Ecosystem support:   Spring MVC (mature)              Spring WebFlux (growing)
+ Best for:            CPU-bound, simple IO             High-concurrency IO-bound
+ Throughput ceiling:  ~10K concurrent (thread limit)   ~100K+ concurrent
+
+Decision Framework:
+  1. < 500 concurrent connections -> Use traditional threads + Spring MVC
+  2. 500-5000 concurrent -> Consider virtual threads (Java 21) first
+  3. > 5000 concurrent IO-bound -> Consider reactive (WebFlux)
+  4. CPU-bound workloads -> Always traditional threads
+  5. Team familiarity matters -> Choose what your team can debug!
+```
+
+## 16.5 Virtual Threads Deep Dive (Project Loom, Java 21+)
+
+```java
+// Virtual threads fundamentally change the threading model:
+
+// OLD MODEL: 1 platform thread per request (limited to ~10K concurrent)
+@Configuration
+public class TomcatConfig {
+    // server.tomcat.threads.max=200  (OS THREAD LIMIT)
+}
+
+// NEW MODEL: 1 virtual thread per request (millions possible)
+// application.properties:
+// spring.threads.virtual.enabled=true  (Spring Boot 3.2+)
+
+// What happens internally:
+// 1. Virtual thread starts on a carrier (platform) thread
+// 2. When virtual thread hits blocking IO (JDBC, HTTP, file read):
+//    - Virtual thread is UNMOUNTED from carrier
+//    - Carrier thread is FREE to run other virtual threads
+// 3. When IO completes:
+//    - Virtual thread is MOUNTED on any available carrier
+//    - Execution continues seamlessly
+
+// Diagram:
+// Carrier threads (platform):  [C1] [C2] [C3] [C4]  (= CPU cores)
+// Virtual threads:             [V1] [V2] [V3] ... [V1000000]
+// 
+// V1 runs on C1 -> V1 blocks on IO -> V1 unmounts -> C1 picks up V47
+// V1's IO completes -> V1 mounts on C3 (any free carrier) -> continues
+```
+
+```
+Virtual Thread Caveats:
+------------------------
+
+1. PINNING: Virtual threads PIN to carrier when inside:
+   - synchronized blocks/methods (cannot unmount!)
+   - JNI/native code
+   FIX: Replace synchronized with ReentrantLock
+
+2. ThreadLocal: Works but each virtual thread gets its own copy
+   Risk: 1 million virtual threads = 1 million ThreadLocal copies = OOM
+   FIX: Use ScopedValue (Java 21 preview) instead of ThreadLocal
+
+3. CPU-bound work: Virtual threads offer NO benefit
+   They only help when threads spend most time WAITING (IO)
+
+4. Thread pools: DON'T pool virtual threads
+   They are cheap to create — just create a new one per task
+   Use: Executors.newVirtualThreadPerTaskExecutor()
+```
+
 ---
 
 # Chapter 17: Common Production Issues
@@ -3297,6 +5100,89 @@ CompletableFuture.supplyAsync(() -> {
 CompletableFuture.supplyAsync(() -> {
     return restTemplate.getForObject(url, Data.class);
 }, ioExecutor); // IO pool designed for blocking calls
+```
+
+## 17.5 Production Thread Debugging Toolkit
+
+### jcmd — The Modern Alternative to jstack
+
+```
+Production debugging commands:
+------------------------------
+
+$ jcmd <PID> Thread.print              # Thread dump (like jstack, but better)
+$ jcmd <PID> Thread.dump_to_file <f>   # Dump to file (Java 21+)
+$ jcmd <PID> VM.native_memory summary  # Native memory usage
+$ jcmd <PID> GC.heap_dump <file>       # Heap dump
+$ jcmd <PID> VM.uptime                 # JVM uptime
+$ jcmd <PID> VM.flags                  # All JVM flags
+
+Java Flight Recorder (JFR) — Zero-overhead production profiling:
+$ jcmd <PID> JFR.start name=recording duration=60s filename=recording.jfr
+$ jcmd <PID> JFR.stop name=recording
+
+Analyze JFR recording:
+$ jfr print --events jdk.ThreadPark recording.jfr   # Thread parking events
+$ jfr print --events jdk.JavaMonitorWait recording.jfr  # Lock wait events
+
+Or use JDK Mission Control (jmc) GUI for visual analysis.
+```
+
+### Thread Dump Analysis Methodology (Step-by-Step)
+
+```
+5-Step Thread Dump Analysis:
+-------------------------------
+
+1. TAKE MULTIPLE DUMPS (3 dumps, 10 seconds apart)
+   $ for i in 1 2 3; do jstack <PID> > dump_$i.txt; sleep 10; done
+
+2. LOOK FOR DEADLOCKS (auto-detected by jstack)
+   Search for: "Found one Java-level deadlock"
+
+3. COUNT THREAD STATES
+   $ grep "java.lang.Thread.State:" dump_1.txt | sort | uniq -c
+     150 RUNNABLE          <- threads doing work or blocking on IO
+      35 WAITING (parking)  <- idle pool threads (normal)
+      15 BLOCKED            <- waiting for locks (problem if high)
+       5 TIMED_WAITING      <- sleeping or waiting with timeout
+
+4. IDENTIFY STUCK THREADS
+   Compare dump_1, dump_2, dump_3:
+   Thread in SAME STATE + SAME STACK in ALL 3 dumps = STUCK
+
+5. FIND THE ROOT CAUSE
+   For BLOCKED threads: follow the chain
+     Thread-3 waiting for lock -> held by Thread-1 -> Thread-1 is doing what?
+   For RUNNABLE but stuck (IO):
+     Look at bottom of stack: SocketInputStream.read() = waiting on network
+```
+
+### Connection Pool Starvation Diagnosis
+
+```java
+// Symptom: All requests timeout, but CPU is low
+// Root cause: All HikariCP connections are checked out, new requests wait forever
+
+// Detection: HikariCP metrics
+@Bean
+public MeterBinder hikariMetrics(HikariDataSource ds) {
+    return registry -> {
+        Gauge.builder("hikari.active", ds, HikariDataSource::getHikariPoolMXBean)
+             .description("Active connections").register(registry);
+        Gauge.builder("hikari.pending", ds.getHikariPoolMXBean(),
+             HikariPoolMXBean::getThreadsAwaitingConnection)
+             .description("Threads waiting for connection").register(registry);
+    };
+}
+
+// Prevention:
+// spring.datasource.hikari.maximum-pool-size=20
+// spring.datasource.hikari.connection-timeout=5000  (fail fast, don't hang)
+// spring.datasource.hikari.leak-detection-threshold=10000  (detect leaks!!)
+//
+// When leak-detection-threshold is set, HikariCP logs a WARNING if a connection
+// is held for more than 10 seconds — this catches forgotten close() calls.
 ```
 
 ---
@@ -3655,7 +5541,7 @@ Expose via Spring Actuator or Micrometer metrics.
 Use multiple BlockingQueues (one per partition) -> consumer threads per queue -> ConcurrentHashMap for deduplication -> CompletableFuture for async persistence -> separate executor for IO. Monitor queue depths and consumer lag.
 
 **Q52. How would you implement a rate limiter using Java concurrency primitives?**
-Use `ConcurrentHashMap<String, Deque<Instant>>` for sliding window. Each request adds timestamp, removes expired ones, checks count ≤ limit. Use `Semaphore` for simpler fixed-rate limiting.
+Use `ConcurrentHashMap<String, Deque<Instant>>` for sliding window. Each request adds timestamp, removes expired ones, checks count <= limit. Use `Semaphore` for simpler fixed-rate limiting.
 
 **Q53. When would you choose reactive programming (WebFlux) over CompletableFuture?**
 WebFlux for very high concurrency with many IO-bound operations (10K+ concurrent connections). CompletableFuture for moderate concurrency, blocking IO that's hard to rewrite, or when team expertise is in imperative style.
@@ -3675,7 +5561,7 @@ ConcurrentHashMap<String, CircuitState> circuitStates;
 Create separate pools: CPU pool (size = cores), IO pool (size = cores x (1 + W/C)). Use CallerRunsPolicy for backpressure. Monitor with metrics. Adjust based on load testing results.
 
 **Q57. What is the impact of context switching on system performance?**
-Each context switch costs 1-10μs. At 10,000 threads with frequent switching, that's 10-100ms overhead per second. Solution: right-size thread pools, use non-blocking IO, virtual threads (Java 21+).
+Each context switch costs 1-10us. At 10,000 threads with frequent switching, that's 10-100ms overhead per second. Solution: right-size thread pools, use non-blocking IO, virtual threads (Java 21+).
 
 **Q58. How to implement graceful shutdown in a multithreaded Spring Boot application?**
 ```java
@@ -3716,6 +5602,80 @@ Use `CountDownLatch` to synchronize thread starts. Use `CyclicBarrier` for stres
 
 **Q65. How to prevent memory leaks in concurrent applications?**
 Clear ThreadLocal variables after use. Weak references in caches (WeakHashMap). Bounded collections with eviction. Properly shut down executors. Monitor with heap dumps and profilers.
+
+---
+
+## SCENARIO-BASED (Q66–Q80)
+
+**Q66. A production Spring Boot app becomes unresponsive under load, but CPU usage is only 5%. What's your debugging approach?**
+Low CPU + unresponsive = threads waiting on something (locks, IO, connections). Steps: 1) Take 3 thread dumps 10s apart. 2) Count BLOCKED and WAITING threads. 3) If many BLOCKED -> lock contention (find the lock). 4) If many WAITING on connection pool -> pool exhaustion (increase pool or add timeouts). 5) Check HikariCP metrics for connection leaks.
+
+**Q67. Your team wants to use parallelStream() for batch database inserts. What's your advice?**
+DON'T do it. parallelStream() uses ForkJoinPool.commonPool() which is shared across the entire JVM. Blocking DB calls will starve ALL other parallel streams. Instead, use a dedicated ExecutorService with CompletableFuture, or batch the inserts into chunks and use JDBC batch operations.
+
+**Q68. You have a microservice making 5 REST calls to downstream services. Currently sequential (2.5s total). How to optimize?**
+Use CompletableFuture with a custom IO executor: `CompletableFuture.allOf(call1, call2, call3, call4, call5)` runs all in parallel. Total time ~= max of individual calls (~500ms instead of 2.5s). Always use `completeOnTimeout()` for each call. If one fails, use `exceptionally()` with fallback.
+
+**Q69. What would happen if you used `Executors.newCachedThreadPool()` in a HTTP API handler?**
+Under load spike, each request creates a new thread (since cached threads are reused only if idle <=60s). A burst of 50,000 requests -> 50,000 threads -> ~50GB memory -> OutOfMemoryError. Always use `newFixedThreadPool()` or `ThreadPoolExecutor` with bounded queue.
+
+**Q70. You observe intermittent NullPointerException in production, but the code looks correct in single-threaded analysis. What could cause this?**
+Race condition on a shared reference: Thread A reads the object, Thread B sets it to null between read and use. Or: instruction reordering — an object reference published before the constructor finishes (broken double-checked locking without volatile). Fix: make the reference volatile, use AtomicReference, or use proper synchronization.
+
+**Q71. A thread dump shows 150 threads in BLOCKED state all waiting on `OrderService.processOrder()`. What's happening?**
+The `processOrder()` method is likely synchronized on a single lock (or uses a synchronized method), creating a bottleneck. Solutions: 1) Reduce synchronized scope. 2) Use ConcurrentHashMap instead of synchronized HashMap. 3) Use read-write lock if mostly reads. 4) Consider lock-free alternatives.
+
+**Q72. Your application has 200 Tomcat threads and a HikariCP pool of 10. What happens when all 200 threads need DB access?**
+190 threads will wait for a connection (only 10 available). If `connectionTimeout` is not set, they wait forever -> request timeouts cascade. Fix: 1) Size connection pool appropriately (but more connections = more DB load). 2) Set `connection-timeout=5000` to fail fast. 3) Use `leak-detection-threshold` to catch leaks.
+
+**Q73. When should you use virtual threads vs reactive programming vs traditional thread pools?**
+Virtual threads (Java 21+): Simple blocking IO code, need to handle many concurrent requests, team prefers imperative style. Reactive (WebFlux): Need full backpressure, streaming data pipelines, already have reactive team. Traditional pools: CPU-bound work, legacy systems, need fine-grained control over concurrency.
+
+**Q74. A CountDownLatch with count 5 hangs forever in production. What happened?**
+One of the 5 tasks threw an uncaught exception before calling `countDown()`. The latch stays at count > 0 forever. Fix: Always call `countDown()` in a finally block, OR use `latch.await(30, TimeUnit.SECONDS)` with a timeout.
+
+**Q75. You need to implement a cache that refreshes every 5 minutes. How to make it thread-safe?**
+Use `AtomicReference<CacheData>` with a scheduled task. The scheduler calls `cacheRef.set(loadFreshData())` atomically. All readers call `cacheRef.get()` (lock-free). Alternatively, use `ConcurrentHashMap.computeIfAbsent()` with TTL-based expiry, or use Caffeine cache (`LoadingCache`).
+
+**Q76. What happens if you use `synchronized` keyword inside virtual threads?**
+Virtual threads PIN to the carrier (platform) thread when inside synchronized blocks. The carrier cannot be reused until the synchronized block completes. Under load, this can exhaust all carrier threads. Fix: Replace synchronized with ReentrantLock, which virtual threads can unmount from.
+
+**Q77. How would you design a thread-safe audit log system that doesn't slow down the main request?**
+Use a producer-consumer pattern: Main thread submits audit events to a `LinkedBlockingQueue` (non-blocking `offer()`). Background consumers `take()` from queue and batch-insert to DB every 5 seconds. Use `ConcurrentLinkedQueue` if you can't afford any blocking on the producer side.
+
+**Q78. Your thread pool monitoring shows queue size keeps growing but completed task count is stable. What's wrong?**
+Producers are faster than consumers. Either: 1) Tasks are slow (check for blocking calls or resource contention). 2) Pool is undersized for the workload. 3) Tasks are deadlocking. Take a thread dump to see what worker threads are doing. Increase pool size or optimize task execution.
+
+**Q79. How do you test that a class is thread-safe in unit tests?**
+```java
+@RepeatedTest(10)  // Run 10 times to catch intermittent failures
+void testConcurrentAccess() throws InterruptedException {
+    ThreadSafeList<String> list = new ThreadSafeList<>();
+    int threads = 100;
+    CountDownLatch ready = new CountDownLatch(threads);
+    CountDownLatch go = new CountDownLatch(1);
+    CountDownLatch done = new CountDownLatch(threads);
+
+    for (int i = 0; i < threads; i++) {
+        final int idx = i;
+        new Thread(() -> {
+            ready.countDown();
+            try { go.await(); } catch (InterruptedException e) {}
+            list.add("item-" + idx);
+            done.countDown();
+        }).start();
+    }
+
+    ready.await();  // All threads ready
+    go.countDown(); // Release all at once
+    done.await();   // Wait for all to finish
+
+    assertEquals(threads, list.size());  // Must always be 100
+}
+```
+
+**Q80. You're reviewing a PR that uses `Collections.synchronizedMap(new HashMap<>())`. What feedback would you give?**
+1) Replace with `ConcurrentHashMap` for better performance (per-bin locking vs whole-map locking). 2) Even with synchronizedMap, compound operations like `if(!map.containsKey(k)) map.put(k,v)` are NOT atomic — still needs external synchronization or `computeIfAbsent()`. 3) Iteration requires manual synchronization with synchronizedMap but not with ConcurrentHashMap.
 
 ---
 
@@ -4309,10 +6269,10 @@ public class ThreadPoolMonitor {
 
 ### 1. Always Use Thread Pools
 ```java
-// ❌ NEVER create raw threads in production
+// [N] NEVER create raw threads in production
 new Thread(() -> processOrder(order)).start();
 
-// ✅ ALWAYS use managed thread pools
+// [Y] ALWAYS use managed thread pools
 executor.submit(() -> processOrder(order));
 ```
 
@@ -4327,10 +6287,10 @@ ThreadFactory factory = r -> {
 
 ### 3. Always Use Bounded Queues
 ```java
-// ❌ Unbounded queue = OOM risk
+// [N] Unbounded queue = OOM risk
 new LinkedBlockingQueue<>()
 
-// ✅ Bounded queue with rejection policy
+// [Y] Bounded queue with rejection policy
 new LinkedBlockingQueue<>(500)
 ```
 
@@ -4352,10 +6312,10 @@ try {
 
 ### 6. Handle InterruptedException Properly
 ```java
-// ❌ Swallowing interrupt
+// [N] Swallowing interrupt
 catch (InterruptedException e) { /* ignore */ }
 
-// ✅ Restore interrupt flag
+// [Y] Restore interrupt flag
 catch (InterruptedException e) {
     Thread.currentThread().interrupt(); // Restore flag
     throw new RuntimeException("Thread was interrupted", e);
@@ -4413,6 +6373,70 @@ public MeterBinder threadPoolMetrics(ThreadPoolExecutor pool) {
 
 **Document Version:** 1.0  
 **Last Updated:** March 2026  
-**Topics Covered:** 20 Chapters, 65+ Interview Questions, 20 Coding Exercises  
+**Topics Covered:** 20 Chapters, 80+ Interview Questions, 20 Coding Exercises  
+
+## Senior Engineer Decision Framework
+
+### Concurrency Approach Selection
+
+```
+Step 1: Do you actually NEED multithreading?
+  +- Is the current approach fast enough? -> Don't add complexity
+  +- Is the bottleneck IO or CPU?
+  |   +- IO: Can you batch requests? Use async IO? Increase pool size?
+  |   +- CPU: Can you optimize the algorithm first?
+  +- Is the data truly shared? Can you partition it?
+
+Step 2: Choose the right concurrency model
+  +- Simple background task -> @Async or CompletableFuture.runAsync()
+  +- Parallel independent calls -> CompletableFuture.allOf()
+  +- Producer-consumer pipeline -> BlockingQueue + dedicated consumers
+  +- CPU-bound batch processing -> parallel streams or ForkJoinPool
+  +- High-concurrency IO (10K+) -> Virtual threads (Java 21) or WebFlux
+  +- Real-time streaming -> Kafka/RxJava/Project Reactor
+
+Step 3: Choose the right synchronization
+  +- Can data be immutable? -> No synchronization needed (BEST)
+  +- Can data be thread-local? -> ThreadLocal or ScopedValue
+  +- Simple counter? -> AtomicInteger or LongAdder
+  +- Key-value access? -> ConcurrentHashMap (always)
+  +- Read-heavy shared state? -> StampedLock or ReadWriteLock
+  +- Complex multi-field update? -> synchronized or ReentrantLock
+```
+
+### Production Readiness Checklist for Concurrent Systems
+
+```
+Before deploying a multithreaded system to production:
+----------------------------------------------------
+
+Thread Pool Configuration:
+  [ ] All pools use bounded queues
+  [ ] Pool sizes are based on workload type (CPU vs IO)
+  [ ] Rejection policies are set (CallerRunsPolicy recommended)
+  [ ] Threads are named (for debugging)
+  [ ] Graceful shutdown is implemented (@PreDestroy)
+
+Safety:
+  [ ] No raw Thread creation (use ExecutorService)
+  [ ] ThreadLocal values are removed after use
+  [ ] InterruptedException is handled properly
+  [ ] No synchronized blocks around IO/network calls
+  [ ] Lock ordering is consistent where nested locks exist
+
+Monitoring:
+  [ ] Thread pool metrics are exposed (active, queue size, rejected)
+  [ ] Connection pool metrics are monitored
+  [ ] Alerting is set for pool exhaustion
+  [ ] Thread dump automation is in place for incidents
+
+Testing:
+  [ ] Concurrent unit tests with CountDownLatch/CyclicBarrier
+  [ ] Load tests with realistic concurrency levels
+  [ ] Stress tests to verify rejection and graceful degradation
+  [ ] Thread dump analysis performed under load
+```
+
+---
 
 

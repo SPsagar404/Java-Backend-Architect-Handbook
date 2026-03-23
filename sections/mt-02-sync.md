@@ -313,6 +313,295 @@ public class GracefulShutdown {
 | Performance | Faster (no locking) | Slower (lock acquisition) |
 | Use case | Simple flags, single writes | Compound operations |
 
+## 5.5 Java Memory Model (JMM) — Deep Dive
+
+### Why the JMM Exists
+
+The Java Memory Model (JSR-133) defines the rules for how threads interact through memory. Without it, the JIT compiler, CPU, and memory hardware are free to **reorder** and **cache** operations in ways that break multithreaded code.
+
+```
+The Problem Without JMM Guarantees:
+────────────────────────────────────
+
+Java code:              What CPU/compiler might actually do:
+  x = 1;                  y = 2;     ← REORDERED! (faster this way)
+  y = 2;                  x = 1;
+
+This reordering is invisible in single-threaded code (same result).
+But in multithreaded code, Thread B might see y=2 but x=0 (old value)!
+
+Sources of reordering:
+1. Compiler (JIT) reordering — for register optimization
+2. CPU instruction reordering — out-of-order execution pipelines
+3. Store buffer reordering — writes buffered before flushing to cache
+4. Cache coherence delays — different cores see updates at different times
+```
+
+### Happens-Before Relationship
+
+The **happens-before** relationship is the foundation of JMM. If action A *happens-before* action B, then A's effects are **guaranteed visible** to B.
+
+```
+Happens-Before Rules (Memorize These!):
+────────────────────────────────────────
+
+1. PROGRAM ORDER RULE
+   Within a single thread, each statement happens-before the next.
+   x = 1;         ← happens-before →
+   y = x + 1;     ← guaranteed to see x = 1
+
+2. MONITOR LOCK RULE
+   An unlock() on a monitor happens-before every subsequent lock() on that monitor.
+   Thread A: synchronized(lock) { x = 1; }        ← unlock happens
+   Thread B: synchronized(lock) { print(x); }     ← lock happens → sees x = 1
+
+3. VOLATILE VARIABLE RULE
+   A write to a volatile variable happens-before every subsequent read of that variable.
+   Thread A: volatile_flag = true;     ← write
+   Thread B: if (volatile_flag) { }    ← read → guaranteed to see true
+
+4. THREAD START RULE
+   Thread.start() happens-before any action in the started thread.
+   x = 42;
+   thread.start();     ← thread.run() sees x = 42
+
+5. THREAD TERMINATION RULE
+   Any action in a thread happens-before Thread.join() returns.
+   // In thread: x = 42;
+   thread.join();      ← after join, caller sees x = 42
+
+6. TRANSITIVITY
+   If A happens-before B, and B happens-before C, then A happens-before C.
+   This is how volatile can be used to publish non-volatile data safely.
+```
+
+### Memory Barriers (Fences)
+
+Memory barriers are CPU instructions that enforce ordering. The JVM inserts them automatically for `volatile` and `synchronized`:
+
+```
+Types of Memory Barriers:
+─────────────────────────
+
+LoadLoad   — All reads BEFORE the barrier complete before reads AFTER it
+StoreStore — All writes BEFORE the barrier are flushed before writes AFTER it
+LoadStore  — All reads BEFORE the barrier complete before writes AFTER it
+StoreLoad  — All writes BEFORE the barrier are flushed before reads AFTER it
+             (most expensive, full memory fence)
+
+What the JVM inserts:
+
+volatile READ:
+  [LoadLoad barrier]
+  read volatile variable
+  [LoadStore barrier]
+
+volatile WRITE:
+  [StoreStore barrier]
+  write volatile variable
+  [StoreLoad barrier]    ← this is why volatile writes are expensive
+
+synchronized ENTER:
+  acquire monitor lock
+  [LoadLoad + LoadStore barrier]    ← refresh all cached values
+
+synchronized EXIT:
+  [StoreStore + LoadStore barrier]  ← flush all writes
+  release monitor lock
+```
+
+### The Double-Checked Locking Pattern Explained
+
+This pattern is the classic example of why JMM matters:
+
+```java
+public class ConnectionPool {
+    // WITHOUT volatile: BROKEN!
+    // private static ConnectionPool instance;
+    
+    // WITH volatile: CORRECT
+    private static volatile ConnectionPool instance;
+    
+    public static ConnectionPool getInstance() {
+        if (instance == null) {                    // 1st check (no lock)
+            synchronized (ConnectionPool.class) {
+                if (instance == null) {            // 2nd check (with lock)
+                    instance = new ConnectionPool(); // ← THE PROBLEM
+                }
+            }
+        }
+        return instance;
+    }
+}
+
+// Why volatile is required:
+// "instance = new ConnectionPool()" is actually 3 steps:
+//   1. Allocate memory for ConnectionPool object
+//   2. Initialize the object (constructor runs)
+//   3. Assign reference to 'instance' variable
+//
+// Without volatile, the CPU may REORDER steps 2 and 3:
+//   1. Allocate memory
+//   3. Assign reference (instance now non-null!)  ← REORDERED!
+//   2. Initialize object (constructor hasn't run yet!)
+//
+// Thread B sees instance != null, returns a PARTIALLY CONSTRUCTED object!
+// volatile prevents this reordering with a StoreStore barrier.
+```
+
+## 5.6 False Sharing — The Hidden Performance Killer
+
+### What is False Sharing?
+
+False sharing occurs when two threads on different cores modify **different variables** that happen to reside on the **same CPU cache line** (64 bytes). Both cores constantly invalidate each other's cache lines, destroying performance.
+
+```
+False Sharing Scenario:
+───────────────────────
+
+class Counters {
+    volatile long counterA = 0;  // Thread 1 writes this
+    volatile long counterB = 0;  // Thread 2 writes this
+}
+
+Memory layout (both fit in ONE 64-byte cache line):
+┌────────────────────────────────────────────────────────────────┐
+│  Cache Line (64 bytes)                                         │
+│  [counterA: 8 bytes] [counterB: 8 bytes] [padding: 48 bytes]  │
+└────────────────────────────────────────────────────────────────┘
+
+Core 0 (Thread 1)              Core 1 (Thread 2)
+  writes counterA                writes counterB
+  → invalidates Core 1's         → invalidates Core 0's
+    cache line!                     cache line!
+  → Core 1 must reload           → Core 0 must reload
+    from L3/memory                  from L3/memory
+
+Result: 10-100x slower than expected!
+Each "independent" write causes a full cache line transfer (~100ns)
+instead of an L1 cache hit (~1ns).
+```
+
+### How to Fix False Sharing
+
+```java
+// Solution 1: @Contended annotation (Java 8+, -XX:-RestrictContended)
+import sun.misc.Contended;
+
+class Counters {
+    @Contended
+    volatile long counterA = 0;   // Padded to its own cache line
+    
+    @Contended
+    volatile long counterB = 0;   // Padded to its own cache line
+}
+
+// Solution 2: Manual padding
+class Counters {
+    volatile long counterA = 0;
+    long p1, p2, p3, p4, p5, p6, p7;  // 56 bytes of padding
+    volatile long counterB = 0;
+    // Now counterA and counterB are on DIFFERENT cache lines
+}
+
+// Real-world example: LongAdder uses @Contended internally
+// on its Cell[] array to avoid false sharing between cells
+```
+
+> **Production Insight:** False sharing is why `LongAdder` is faster than `AtomicLong` under high contention. `LongAdder` spreads updates across multiple cache-line-padded cells, so different threads don't invalidate each other's cache lines.
+
+## 5.7 Atomic Classes — Lock-Free Thread Safety
+
+### The CAS (Compare-And-Swap) Hardware Instruction
+
+All Atomic classes are built on top of **CAS** — an atomic CPU instruction that enables lock-free programming:
+
+```
+CAS(memoryLocation, expectedValue, newValue):
+  Atomically:
+    if (memoryLocation == expectedValue) {
+        memoryLocation = newValue;
+        return true;   // Success
+    } else {
+        return false;  // Someone else changed it first, try again
+    }
+
+CPU instruction: CMPXCHG on x86, LL/SC on ARM
+
+How AtomicInteger.incrementAndGet() works internally:
+  1. Read current value (e.g., 5)
+  2. Compute new value (5 + 1 = 6)
+  3. CAS(address, 5, 6) 
+     → If current is still 5: set to 6, return true ✓
+     → If current is now 7 (another thread changed it): return false ✗
+  4. If CAS failed: RETRY from step 1 (spin loop)
+```
+
+### Atomic Classes Overview
+
+```java
+// AtomicInteger / AtomicLong — atomic int/long operations
+AtomicInteger counter = new AtomicInteger(0);
+counter.incrementAndGet();                      // Thread-safe ++
+counter.compareAndSet(expected, newValue);       // CAS
+counter.getAndUpdate(x -> x * 2);               // Atomic function application
+counter.accumulateAndGet(5, Integer::sum);       // Atomic accumulation
+
+// AtomicBoolean — atomic flag
+AtomicBoolean initialized = new AtomicBoolean(false);
+if (initialized.compareAndSet(false, true)) {
+    // Only ONE thread enters here — guaranteed
+    performInitialization();
+}
+
+// AtomicReference<V> — atomic reference swap
+AtomicReference<Config> configRef = new AtomicReference<>(loadConfig());
+// Atomically update config (lock-free)
+configRef.updateAndGet(old -> loadNewConfig());
+
+// AtomicStampedReference<V> — solves the ABA problem
+AtomicStampedReference<String> ref = new AtomicStampedReference<>("A", 0);
+int[] stampHolder = new int[1];
+String value = ref.get(stampHolder);   // Gets value AND stamp
+ref.compareAndSet("A", "B", stampHolder[0], stampHolder[0] + 1);
+```
+
+### LongAdder vs AtomicLong (Critical for High-Contention Counters)
+
+```java
+// AtomicLong: ONE variable, ALL threads CAS on it → contention bottleneck
+AtomicLong atomicCounter = new AtomicLong(0);
+atomicCounter.incrementAndGet();  // Under 100 threads: LOTS of CAS retries
+
+// LongAdder: MULTIPLE cells, threads spread across cells → minimal contention
+LongAdder adderCounter = new LongAdder();
+adderCounter.increment();         // Under 100 threads: each thread hits different cell
+long total = adderCounter.sum();  // Sum all cells (slightly stale, but fast)
+```
+
+```
+Performance comparison (100 threads, 1M increments each):
+─────────────────────────────────────────────────────────
+AtomicLong:    ~3,200 ms  (all threads fighting over one CAS)
+LongAdder:     ~380 ms   (threads spread across padded cells)
+synchronized:  ~4,500 ms  (lock acquisition overhead)
+
+When to use which:
+  AtomicLong  → low contention, need exact real-time value
+  LongAdder   → high contention, can tolerate slightly stale sum()
+  LongAccumulator → high contention, custom accumulation function
+```
+
+### Atomic vs Volatile vs Synchronized Decision Table
+
+| Requirement | Use | Why |
+|---|---|---|
+| Simple flag (one writer, many readers) | `volatile` | Cheapest visibility guarantee |
+| Counter (multiple writers) | `AtomicInteger` / `LongAdder` | Lock-free, no blocking |
+| Check-then-act (compare-and-swap) | `AtomicReference.CAS()` | Single atomic operation |
+| Multiple fields must be consistent | `synchronized` / `ReentrantLock` | Only way to group operations |
+| High-contention counter | `LongAdder` | Distributes contention across cells |
+
 ---
 
 # Chapter 6: Inter-Thread Communication
@@ -807,6 +1096,280 @@ public class Point {
 | Performance | Good | Good | Better (reads) | **Best** (reads) |
 | Complexity | Low | Medium | Medium | High |
 
+## 7.4 AbstractQueuedSynchronizer (AQS) — The Backbone
+
+Almost every synchronization utility in `java.util.concurrent` is built on top of **AQS**: ReentrantLock, Semaphore, CountDownLatch, ReentrantReadWriteLock, and more.
+
+```
+AQS Internal Structure:
+────────────────────────
+
+┌──────────────────────────────────────────────────┐
+│  AbstractQueuedSynchronizer                       │
+│                                                   │
+│  state: int (volatile)                            │
+│    - ReentrantLock: 0 = unlocked, N = lock count  │
+│    - Semaphore: number of permits remaining        │
+│    - CountDownLatch: count remaining               │
+│                                                   │
+│  CLH Wait Queue (FIFO):                           │
+│  ┌──────┐    ┌──────┐    ┌──────┐                 │
+│  │Head  │ →  │Node 1│ →  │Node 2│ → null          │
+│  │(dummy)│    │(T1)  │    │(T2)  │                 │
+│  └──────┘    └──────┘    └──────┘                 │
+│               Thread 1    Thread 2                 │
+│               WAITING     WAITING                  │
+│                                                   │
+│  exclusiveOwnerThread: Thread                     │
+│    - Which thread currently owns the lock          │
+└──────────────────────────────────────────────────┘
+
+How ReentrantLock.lock() works internally:
+  1. Try CAS(state, 0, 1) — fast path (no contention)
+     → Success: set exclusiveOwnerThread = currentThread, return
+  2. If CAS fails: is currentThread == owner? (reentrant check)
+     → Yes: state++ (increment hold count), return
+  3. Otherwise: create CLH Node, add to queue tail (CAS)
+     → Park thread using LockSupport.park()
+     → When unparked: retry acquisition from queue head
+```
+
+> **Interview Gold:** When asked "how does ReentrantLock work internally?", explain the AQS state variable, CLH queue, and the fast-path CAS acquisition. This demonstrates deep JVM knowledge.
+
+## 7.5 Synchronization Utilities
+
+### CountDownLatch — Wait for N Events
+
+**Use case:** Main thread waits for multiple worker threads to complete initialization.
+
+```java
+// Production scenario: Service startup — wait for all caches to warm up
+@Component
+public class ApplicationStartup {
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void onStartup() throws InterruptedException {
+        CountDownLatch latch = new CountDownLatch(3);  // Wait for 3 tasks
+        
+        executor.submit(() -> {
+            loadUserCache();        // Takes ~2 seconds
+            latch.countDown();      // 3 → 2
+        });
+        executor.submit(() -> {
+            loadProductCatalog();   // Takes ~3 seconds
+            latch.countDown();      // 2 → 1
+        });
+        executor.submit(() -> {
+            warmUpConnectionPool(); // Takes ~1 second
+            latch.countDown();      // 1 → 0
+        });
+        
+        boolean completed = latch.await(30, TimeUnit.SECONDS);  // Wait for all 3
+        if (!completed) {
+            throw new IllegalStateException("Startup timed out!");
+        }
+        log.info("All caches warmed. Application ready to serve traffic.");
+    }
+}
+```
+
+```
+CountDownLatch internals (backed by AQS):
+  state = N (initial count)
+  countDown() → decrementAndGet(state)
+  await()     → if state > 0, park thread
+  When state reaches 0 → unpark ALL waiting threads
+
+Key properties:
+  • ONE-TIME USE — cannot be reset (use CyclicBarrier for reusable)
+  • Multiple threads can await() on the same latch
+  • countDown() can be called by different threads
+```
+
+### CyclicBarrier — Synchronize N Threads at a Barrier Point
+
+**Use case:** Multiple threads must all reach a checkpoint before any can proceed (common in iterative algorithms).
+
+```java
+// Production scenario: Parallel data processing with merge step
+public class ParallelReportGenerator {
+
+    public Report generateReport(List<DataSource> sources) throws Exception {
+        int parties = sources.size();
+        List<PartialReport> results = Collections.synchronizedList(new ArrayList<>());
+        
+        // Barrier action runs when ALL threads arrive
+        CyclicBarrier barrier = new CyclicBarrier(parties, () -> {
+            log.info("All {} partitions processed. Merging results...", parties);
+        });
+        
+        for (DataSource source : sources) {
+            executor.submit(() -> {
+                try {
+                    PartialReport partial = processDataSource(source);
+                    results.add(partial);
+                    barrier.await(60, TimeUnit.SECONDS);  // Wait for all threads
+                } catch (Exception e) {
+                    log.error("Partition failed", e);
+                }
+            });
+        }
+        
+        return mergeReports(results);
+    }
+}
+```
+
+```
+CyclicBarrier vs CountDownLatch:
+─────────────────────────────────
+                    CountDownLatch        CyclicBarrier
+  Reusable?         No (one-time)         Yes (reset after trip)
+  Who waits?        Any thread            Only the participating threads
+  Who counts down?  Any thread            The waiting threads themselves
+  Barrier action?   No                    Yes (Runnable at trip point)
+  Use case          "Wait for N events"   "All N threads synchronize"
+```
+
+### Semaphore — Control Concurrent Access to a Resource
+
+**Use case:** Limit the number of concurrent connections, API calls, or resource accesses.
+
+```java
+// Production scenario: Rate-limiting external API calls
+@Service
+public class ExternalApiClient {
+    
+    // Only 10 concurrent API calls allowed (rate limit from provider)
+    private final Semaphore semaphore = new Semaphore(10);
+    
+    public ApiResponse callExternalApi(ApiRequest request) {
+        try {
+            semaphore.acquire();                   // Block if 10 calls in progress
+            try {
+                return restTemplate.postForObject(API_URL, request, ApiResponse.class);
+            } finally {
+                semaphore.release();               // Release permit
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted waiting for API permit", e);
+        }
+    }
+    
+    // Non-blocking alternative
+    public Optional<ApiResponse> tryCallApi(ApiRequest request) {
+        if (semaphore.tryAcquire()) {             // Don't block, return Optional.empty
+            try {
+                return Optional.of(restTemplate.postForObject(API_URL, request, ApiResponse.class));
+            } finally {
+                semaphore.release();
+            }
+        }
+        return Optional.empty();                   // API at capacity
+    }
+}
+```
+
+```
+Semaphore internals (backed by AQS):
+  state = N (number of permits)
+  acquire() → if state > 0: CAS(state, state-1), proceed
+              if state == 0: park thread in CLH queue
+  release() → CAS(state, state+1), unpark one waiting thread
+
+Binary Semaphore (permits=1) vs ReentrantLock:
+  • Semaphore is NOT reentrant — same thread acquiring twice will deadlock!
+  • Semaphore has no "owner" — any thread can release()
+  • Use Semaphore for "resource pool" semantics, ReentrantLock for "mutual exclusion"
+```
+
+### Phaser — Dynamic Multi-Phase Synchronization
+
+**Use case:** When the number of participating threads may change dynamically, or when processing has multiple phases.
+
+```java
+// Production scenario: Multi-phase ETL pipeline
+public class EtlPipeline {
+    
+    public void runPipeline(List<DataFile> files) {
+        Phaser phaser = new Phaser(1);  // Register self as coordinator
+        
+        for (DataFile file : files) {
+            phaser.register();  // Dynamically register each worker
+            executor.submit(() -> {
+                try {
+                    // Phase 0: Extract
+                    RawData data = extract(file);
+                    phaser.arriveAndAwaitAdvance();  // Wait for all extractions
+                    
+                    // Phase 1: Transform
+                    TransformedData transformed = transform(data);
+                    phaser.arriveAndAwaitAdvance();  // Wait for all transformations
+                    
+                    // Phase 2: Load
+                    load(transformed);
+                    phaser.arriveAndDeregister();    // Done, deregister
+                } catch (Exception e) {
+                    phaser.arriveAndDeregister();    // Deregister on failure too
+                }
+            });
+        }
+        
+        phaser.arriveAndDeregister();  // Coordinator deregisters
+    }
+}
+```
+
+### Synchronization Utilities Summary
+
+| Utility | Purpose | Reusable | Typical Use Case |
+|---|---|---|---|
+| `CountDownLatch` | Wait for N events | No | Startup initialization |
+| `CyclicBarrier` | Synchronize N threads at a point | Yes | Iterative parallel algorithms |
+| `Semaphore` | Limit concurrent access | Yes | Connection pools, rate limiting |
+| `Phaser` | Dynamic multi-phase sync | Yes | Multi-phase processing pipelines |
+| `Exchanger` | Two threads swap data | Yes | Pipeline stage handoffs |
+
+## 7.6 JIT Lock Optimizations
+
+The JIT compiler (HotSpot C2) automatically optimizes locking when it can prove it's safe:
+
+```
+Lock Coarsening:
+────────────────
+JIT combines adjacent synchronized blocks on the same object:
+
+Before optimization:            After optimization:
+  synchronized(lock) { a++; }     synchronized(lock) {
+  synchronized(lock) { b++; }       a++;
+  synchronized(lock) { c++; }       b++;
+                                    c++;
+                                  }
+Result: 3 lock/unlock pairs → 1 lock/unlock pair
+
+Lock Elision (Biased Locking):
+──────────────────────────────
+JIT detects locks that can never be contended (escape analysis):
+
+  void method() {
+      StringBuilder sb = new StringBuilder();  // Thread-local object
+      sb.append("Hello");                       // sb never escapes this method
+      sb.append(" World");                      // sb.append is synchronized internally
+      return sb.toString();
+  }
+  
+  JIT eliminates ALL synchronization on sb because it proves
+  sb never escapes to another thread. Zero-cost locking!
+
+Lock Striping (Manual technique):
+─────────────────────────────────
+Split one lock into N locks, each protecting 1/N of the data:
+  Before: ONE lock for entire HashMap → all threads contend
+  After:  16 locks, each for a range of buckets → 16x less contention
+  This is exactly what ConcurrentHashMap does internally.
+```
+
 ---
 
 # Chapter 8: Java Concurrent Collections
@@ -1098,4 +1661,145 @@ public class EventBuffer {
 | `ConcurrentLinkedQueue` | CAS (lock-free) | No | High-throughput non-blocking |
 | `SynchronousQueue` | Direct handoff | Yes | Thread-to-thread handoff |
 
+## 8.5 ConcurrentHashMap Internals (Java 8+)
+
+Understanding the internal structure helps you know *why* it's so fast and when to expect limitations:
+
+```
+ConcurrentHashMap Internal Structure (Java 8+):
+────────────────────────────────────────────────
+
+Table (Node[] array):
+┌──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┐
+│ Bin 0│ Bin 1│ Bin 2│ Bin 3│ Bin 4│ Bin 5│ Bin 6│ Bin 7│
+└──┬───┘──────┘──┬───┘──────┘──────┘──────┘──┬───┘──────┘
+   │             │                            │
+   ↓             ↓                            ↓
+  [K=A,V=1]    [K=C,V=3]                   [K=F,V=6]
+   │             │                            │
+   ↓             ↓                            ↓
+  [K=B,V=2]    [K=D,V=4]                   [K=G,V=7]
+   │                                          │
+   ↓                                          ↓
+  null                              ☆ TREEIFIED (TreeNode)
+                                      if > 8 entries per bin!
+
+Java 8 Changes from Java 7:
+───────────────────────────
+Java 7: Segment-based locking (16 fixed segments)
+Java 8: Per-bin locking with CAS + synchronized on the head node
+
+Put operation flow:
+  1. Compute hash → find bin index
+  2. If bin is empty → CAS to insert head node (no lock!)
+  3. If bin is not empty → synchronized(headNode) {
+       - Traverse linked list / tree
+       - Insert new node or update value
+     }
+  4. If bin size > 8 (TREEIFY_THRESHOLD) → convert linked list to Red-Black Tree
+  5. If bin size < 6 (UNTREEIFY_THRESHOLD) → convert back to linked list
+
+Get operation (LOCK-FREE!):
+  1. Compute hash → find bin
+  2. Traverse chain/tree using volatile reads
+  3. No locking at all — reads are always lock-free
+```
+
+### ConcurrentHashMap Pitfalls
+
+```java
+// ❌ PITFALL 1: Non-atomic check-then-act
+if (!map.containsKey(key)) {       // Thread A checks: not present
+    map.put(key, computeValue());  // Thread B inserts between check and put!
+}
+
+// ✅ FIX: Use atomic operations
+map.putIfAbsent(key, computeValue());              // Atomic
+map.computeIfAbsent(key, k -> computeValue());     // Atomic, lazy computation
+
+// ❌ PITFALL 2: Size is NOT exact (weakly consistent)
+int size = map.size();  // May be stale during concurrent modifications
+
+// ❌ PITFALL 3: Null keys/values not allowed (by design)
+map.put(null, "value");    // NullPointerException!
+map.put("key", null);      // NullPointerException!
+// Reason: null is used internally as a sentinel for absent values
+
+// ✅ BEST PRACTICE: Use compute methods for atomic read-modify-write
+map.compute(key, (k, v) -> v == null ? 1 : v + 1);  // Atomic increment
+map.merge(key, 1, Integer::sum);                      // Atomic merge
+```
+
+## 8.6 ConcurrentSkipListMap / ConcurrentSkipListSet
+
+A **sorted**, thread-safe map implementation using skip lists instead of trees. Provides O(log n) operations with good concurrency.
+
+```
+Skip List Structure:
+────────────────────
+
+Level 2:  HEAD ──────────────────────→ 15 ──────────→ NULL
+             │                          │
+Level 1:  HEAD ────→ 5 ──────────→ 15 ────→ 25 ──→ NULL
+             │       │              │        │
+Level 0:  HEAD → 3 → 5 → 8 → 12 → 15 → 25 → 30 → NULL
+
+Properties:
+  • Lock-free reads (CAS-based updates)
+  • O(log n) get, put, remove
+  • SORTED order (unlike ConcurrentHashMap)
+  • Supports range queries: subMap(), headMap(), tailMap()
+  • NavigableMap interface (ceiling, floor, higher, lower)
+```
+
+```java
+// When to use ConcurrentSkipListMap vs ConcurrentHashMap:
+ConcurrentHashMap<String, Integer> hashMap;     // O(1) get/put, UNSORTED
+ConcurrentSkipListMap<String, Integer> skipMap; // O(log n) get/put, SORTED
+
+// Use ConcurrentSkipListMap when you need:
+//   - Sorted iteration (by key order)
+//   - Range queries (subMap, headMap, tailMap)
+//   - NavigableMap operations (ceilingKey, floorKey)
+//   - Concurrent sorted set (ConcurrentSkipListSet)
+
+// Production example: Time-series data with range queries
+ConcurrentSkipListMap<Instant, Metric> timeSeries = new ConcurrentSkipListMap<>();
+timeSeries.put(Instant.now(), new Metric("cpu", 85.2));
+
+// Get all metrics from last 5 minutes (efficient range query!)
+NavigableMap<Instant, Metric> recent = timeSeries.tailMap(
+    Instant.now().minus(Duration.ofMinutes(5)), true);
+```
+
+## 8.7 Choosing the Right Concurrent Collection
+
+```
+Decision Flowchart:
+───────────────────
+
+Need a Map?
+  ├─ Need sorted keys? → ConcurrentSkipListMap
+  └─ Don't need sorting? → ConcurrentHashMap (always)
+
+Need a List?
+  ├─ Read-heavy, small list, rare writes? → CopyOnWriteArrayList
+  └─ Write-heavy or large list? → Use ConcurrentHashMap or synchronize manually
+
+Need a Queue?
+  ├─ Need blocking (producer-consumer)?
+  │   ├─ Need bounded capacity? → ArrayBlockingQueue
+  │   ├─ Need priority ordering? → PriorityBlockingQueue
+  │   ├─ Need direct handoff (no buffer)? → SynchronousQueue
+  │   └─ General purpose? → LinkedBlockingQueue
+  └─ Non-blocking?
+      └─ ConcurrentLinkedQueue
+
+Need a Set?
+  ├─ Need sorted? → ConcurrentSkipListSet
+  └─ Unordered? → ConcurrentHashMap.newKeySet()
+      (or Collections.newSetFromMap(new ConcurrentHashMap<>()))
+```
+
 ---
+

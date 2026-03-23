@@ -73,6 +73,22 @@ productRepository.findAll(spec, pageable);
 
 **How Hibernate implements it:** The Session/EntityManager IS the Unit of Work. It tracks all persistent entities and flushes changes on commit.
 
+**Internal Mechanism:**
+```
+Unit of Work maintains:
+  1. IdentityMap -- tracks all loaded entities by type + ID
+  2. EntitySnapshots -- original state for dirty checking
+  3. ActionQueue -- pending INSERT/UPDATE/DELETE actions
+  4. CollectionEntries -- tracks collection modifications
+  
+On flush():
+  1. Dirty check ALL entities (compare current vs snapshot)
+  2. Sort actions (INSERTs first, DELETEs last for FK integrity)
+  3. Generate SQL via Dialect
+  4. Execute batch JDBC operations
+  5. Update snapshots to current state
+```
+
 ```java
 @Transactional // Defines the Unit of Work boundary
 public void processOrder(OrderRequest request) {
@@ -91,11 +107,38 @@ public void processOrder(OrderRequest request) {
 }
 ```
 
+## 22.5 Identity Map Pattern
+
+**What:** Ensures that within a single Unit of Work (Session), each database row is represented by exactly ONE Java object. Loading User(id=1) twice returns the same object reference.
+
+**Why it matters:** Without Identity Map, two different objects could represent the same row, leading to conflicting updates.
+
+```java
+@Transactional
+public void demo() {
+    User u1 = userRepo.findById(1L).get();
+    User u2 = userRepo.findById(1L).get();
+    
+    assert u1 == u2; // TRUE! Same object reference (Identity Map)
+    
+    u1.setName("Alice");
+    System.out.println(u2.getName()); // "Alice" -- same object!
+}
+```
+
 ---
 
 # Part 23: Best Practices
 
 ## 23.1 Entity Design
+
+### Deep Theory: Why equals/hashCode Must Use Business Key
+
+Hibernate uses `equals()` and `hashCode()` for Set operations, merge detection, and second-level cache lookups. Using `@Id` for equals/hashCode is broken because:
+- Before `persist()`, id is `null` -- entities can't be in Sets
+- After `persist()`, id changes from null to a value -- hashCode changes, breaking HashMap contract
+
+**Rule:** Use a stable business key (email, ISBN, SSN) or a UUID assigned in the constructor.
 
 ```java
 // 1. Always override equals() and hashCode() using business key
@@ -125,7 +168,7 @@ public class User {
 @ManyToOne(fetch = FetchType.LAZY) // Override EAGER default!
 private Customer customer;
 
-// 3. Use Set instead of List for ManyToMany (avoids duplicates)
+// 3. Use Set instead of List for ManyToMany (avoids delete-all + re-insert)
 @ManyToMany
 private Set<Role> roles = new HashSet<>();
 
@@ -955,8 +998,42 @@ class UserRepositoryTest {
 
 ---
 
+## Scenario-Based Debugging Questions (S1-S10)
+
+**S1. Your app generates 500 SQL queries for a single API call. How do you diagnose and fix this?**
+Diagnosis: Enable `hibernate.generate_statistics=true`. The log shows query count per session. Root cause is almost always N+1. Fix: identify which lazy collection is triggering queries, add JOIN FETCH or @EntityGraph for that specific endpoint.
+
+**S2. Users report that updates are "not saving" intermittently. What could cause this?**
+Possible causes: (1) Entity is detached (accessed outside @Transactional boundary), (2) Self-invocation -- @Transactional method called from same class, (3) merge() used but original reference modified instead of returned reference, (4) @Transactional(readOnly=true) accidentally applied to a write method.
+
+**S3. Your batch job processes 100K records and runs out of memory. How to fix?**
+Process in pages (500 at a time), call `entityManager.flush()` and `entityManager.clear()` after each page. Consider using StatelessSession for pure bulk operations. Monitor heap usage with `-Xmx` and GC logs.
+
+**S4. After adding a new enum value, production data starts showing wrong statuses. What happened?**
+The entity uses `@Enumerated(EnumType.ORDINAL)`. Adding or reordering enum values shifts ordinal positions, corrupting all existing data. Fix: migrate to `EnumType.STRING` and run a data migration script.
+
+**S5. Your application takes 45 seconds to start. What Hibernate-related issues could cause this?**
+Possible causes: (1) Multiple SessionFactory instances being created, (2) `ddl-auto: update` scanning and altering large schemas, (3) Thousands of @NamedQuery validations, (4) Entity scanning across too many packages. Check: duplicate @EntityScan, multiple persistence units.
+
+**S6. Connection pool exhaustion occurs under load. What do you investigate?**
+Check: (1) Long-running transactions (external API calls inside @Transactional), (2) Missing @Transactional causing separate connection per repository call, (3) Leak detection not configured, (4) Pool size too small for concurrent request count. Enable `hikari.leak-detection-threshold=30000`.
+
+**S7. Two users buying the last item both succeed, and inventory goes negative. How to prevent this?**
+Add `@Version` field to Inventory entity (optimistic locking). The second user's UPDATE fails because version changed. Wrap in `@Retryable` with `OptimisticLockException`. For critical inventory, consider pessimistic locking: `@Lock(LockModeType.PESSIMISTIC_WRITE)`.
+
+**S8. A developer reports that deleteAll() on a table with 1 million rows takes 10 minutes. How to optimize?**
+`deleteAll()` loads ALL entities first, then deletes one by one (1M SELECT + 1M DELETE). Use `deleteAllInBatch()` which executes a single `DELETE FROM table` SQL. For conditional deletes, use `@Modifying @Query("DELETE FROM Entity WHERE ...")` bulk operation.
+
+**S9. Customer reports seeing another customer's data. How could Hibernate cause this?**
+A shared Session across threads (non-thread-safe). Or Open Session in View with thread pool recycling. Or second-level cache returning stale/incorrect data after a cache invalidation failure. Check thread safety of EntityManager injection and OSIV settings.
+
+**S10. After migrating from MySQL to PostgreSQL, some queries fail with syntax errors. What went wrong?**
+Native queries use MySQL-specific syntax (LIMIT without OFFSET, backtick identifiers, GROUP_CONCAT). JPQL queries are portable, native queries are NOT. Identify all `nativeQuery = true` methods and verify PostgreSQL compatibility. Also check Dialect configuration in application.yml.
+
+---
+
 *End of Guide*
 
-**Document Version:** 1.0
+**Document Version:** 2.0 (Enhanced Edition)
 **Last Updated:** March 2026
-**Topics Covered:** 25 Parts, 103 Interview Questions, 20 Coding Exercises
+**Topics Covered:** 25 Parts, 103+ Interview Questions, 10 Scenario-Based Debugging Questions, 20 Coding Exercises

@@ -1,6 +1,15 @@
 
 # Part 17: Performance Optimization
 
+### Deep Theory: The Three Pillars of Hibernate Performance
+
+Every Hibernate performance problem falls into one of three categories:
+1. **Too many queries** (N+1 problem) -- Fix with JOIN FETCH, @EntityGraph, @BatchSize
+2. **Too much data** (loading full entities when only 3 columns needed) -- Fix with DTO projections
+3. **Too long transactions** (holding DB connection for seconds) -- Fix by separating external calls
+
+Mastering these three areas eliminates 95% of Hibernate performance issues.
+
 ## 17.1 Batch Fetching
 
 ```java
@@ -29,6 +38,15 @@ public class Customer {
 
 ## 17.2 Connection Pooling (HikariCP)
 
+### Deep Theory: Why Connection Pool Sizing Matters
+
+Opening a database connection takes 20-50ms (TCP handshake, SSL negotiation, authentication). HikariCP pre-creates connections so they're ready instantly.
+
+**Formula for pool size:** `connections = (core_count * 2) + effective_spindle_count`
+For a 4-core server with SSD: `(4 * 2) + 1 = 9` connections max. Most apps work well with 10-20.
+
+**Warning:** Setting pool size too high HURTS performance. With 100 connections, the database spends more time context-switching between connections than executing queries.
+
 ```yaml
 spring:
   datasource:
@@ -41,7 +59,25 @@ spring:
       leak-detection-threshold: 60000  # Detect connection leaks
 ```
 
+**Production Tip -- leak-detection-threshold:** If a connection is checked out for longer than this threshold (60s), HikariCP logs a warning with the stack trace showing WHERE the connection was borrowed. This is invaluable for finding long-running transactions.
+
 ## 17.3 DTO Projections (Avoid Fetching Full Entities)
+
+### Deep Theory: Why DTO Projections are Critical
+
+Loading a full entity triggers:
+1. ALL columns selected (including large TEXT/BLOB)
+2. Entity snapshot created (400 bytes per entity for dirty checking)
+3. Entity stored in persistence context (memory)
+4. All EAGER associations loaded (more queries)
+
+A DTO projection avoids ALL of this overhead.
+
+| Projection Type | Performance | Type Safety | Use When |
+|---|---|---|---|
+| Interface-based | Good | Compile-time | Simple projections |
+| Class-based (record) | Best | Compile-time | Complex projections |
+| Tuple / Object[] | Best | No | Quick analytics |
 
 ```java
 // Interface-based projection
@@ -57,7 +93,7 @@ public interface UserRepository extends JpaRepository<User, Long> {
     // NOT: SELECT * FROM users ... (avoids loading unnecessary columns)
 }
 
-// Class-based projection (DTO)
+// Class-based projection (DTO) -- best performance
 public record UserDTO(Long id, String name, String email) {}
 
 @Query("SELECT new com.app.dto.UserDTO(u.id, u.name, u.email) " +
@@ -84,9 +120,40 @@ int bulkUpdateStatus(@Param("ids") List<Long> ids,
 // Single UPDATE query regardless of list size
 ```
 
+### Interview Questions for Part 17
+
+**Q: How do you decide between interface-based and class-based DTO projections?**
+A: Interface-based projections are simpler to write but slightly slower (Spring creates proxies). Class-based (records) are fastest because Hibernate creates objects directly. Use records for performance-critical paths.
+
+**Q: What is the formula for HikariCP pool size?**
+A: `(core_count * 2) + spindle_count`. For a 4-core server with SSD: ~9 connections. Setting pool size too high causes database context-switching overhead and actually degrades performance.
+
 ---
 
 # Part 18: Hibernate Caching
+
+### Deep Theory: Cache Lookup Flow
+
+When you call `entityManager.find(User.class, 1L)`, Hibernate searches caches in order:
+
+```
+find(User.class, 1L)
+  |
+  v
+1st Level Cache (Persistence Context) -- ALWAYS checked first
+  |-- FOUND? Return immediately (same object reference)
+  |-- NOT FOUND?
+  v
+2nd Level Cache (if enabled) -- Shared across sessions
+  |-- FOUND? Hydrate entity from cached data, add to 1st level cache
+  |-- NOT FOUND?
+  v
+Database Query -- SELECT * FROM users WHERE id = 1
+  |-- Result mapped to entity
+  |-- Stored in 1st level cache
+  |-- Stored in 2nd level cache (if enabled for this entity)
+  |-- Returned to caller
+```
 
 ## 18.1 First-Level Cache (Session Cache)
 
@@ -209,6 +276,20 @@ List<Product> findByCategory(String category);
 // Invalidated when any Product entity changes
 ```
 
+### Production Warning: Query Cache Invalidation Trap
+
+The query cache invalidates ALL cached queries for an entity type whenever ANY entity of that type is inserted, updated, or deleted. If you have a frequently-updated `Product` table, caching `findByCategory` is pointless -- the cache is invalidated on every product update.
+
+**Use query cache ONLY for:** Rarely-changed reference data (countries, currencies, configuration values).
+
+### Interview Questions for Part 18
+
+**Q: What is the difference between 1st and 2nd level cache?**
+A: 1st level cache is per-session, always-on, and guarantees object identity (same ID = same reference). 2nd level cache is shared across all sessions, optional, and must be explicitly configured per entity.
+
+**Q: When should you NOT use the query cache?**
+A: When the underlying entity table is frequently updated. The query cache invalidates ALL cached queries for an entity type on any INSERT/UPDATE/DELETE, making it counterproductive for actively modified tables.
+
 ---
 
 # Part 19: Common Performance Problems
@@ -249,7 +330,7 @@ public Customer getCustomer(@PathVariable Long id) {
 
 **Solutions:**
 ```java
-// Solution 1: Fetch eagerly in the query
+// Solution 1: Fetch eagerly in the query (BEST)
 @Query("SELECT c FROM Customer c JOIN FETCH c.orders WHERE c.id = :id")
 Customer findByIdWithOrders(@Param("id") Long id);
 
@@ -264,6 +345,15 @@ public CustomerDTO getCustomerWithOrders(Long id) {
 @EntityGraph(attributePaths = {"orders"})
 Optional<Customer> findById(Long id);
 ```
+
+### Production Warning: NEVER Use Open Session in View
+
+`spring.jpa.open-in-view=true` (Spring Boot default!) keeps the Hibernate Session open through the entire HTTP request, including view rendering. This prevents LazyInitializationException but:
+- Holds database connections for the entire request duration
+- Leads to N+1 queries in controllers/templates
+- Causes connection pool exhaustion under load
+
+**Always disable it:** `spring.jpa.open-in-view=false`
 
 ## 19.3 Slow Queries
 
@@ -306,6 +396,14 @@ do {
     page++;
 } while (batch.hasNext());
 ```
+
+### Interview Questions for Part 19
+
+**Q: What causes LazyInitializationException?**
+A: Accessing a LAZY association after the Hibernate Session/EntityManager has been closed. The proxy can't execute the SQL to load data. Fix: use JOIN FETCH, @EntityGraph, or ensure access happens within a @Transactional method.
+
+**Q: Should you enable spring.jpa.open-in-view?**
+A: No. It holds database connections for the entire HTTP request including view rendering, leading to connection pool exhaustion. Always disable it and use JOIN FETCH or @EntityGraph instead.
 
 ---
 
@@ -518,6 +616,15 @@ public class UserController {
 1. Each service owns its database -- no direct cross-service DB access
 2. Services communicate via APIs or events, never via shared DB
 3. Each service has its own `application.yml` with its own datasource
+4. **NO @ManyToOne or @OneToMany across service boundaries** -- use IDs and API calls
+
+### Deep Theory: Why Database Per Service
+
+Sharing a database between services creates **tight coupling**:
+- Schema changes in one service break another
+- One service's slow query blocks another's connections
+- You can't independently scale or deploy services
+- Transaction boundaries become unclear
 
 ## 21.2 Saga Pattern (Distributed Transactions)
 
@@ -601,6 +708,30 @@ public void handleOrderCreated(OrderCreatedEvent event) {
     inventoryService.reserveStock(event.getOrderId(), event.getItems());
 }
 ```
+
+### Deep Theory: The Outbox Pattern (Reliable Events)
+
+The code above has a critical flaw: if `orderRepository.save()` succeeds but `kafkaTemplate.send()` fails, you have an order in the DB but no event published. The **Outbox Pattern** fixes this:
+
+```java
+@Transactional
+public Order createOrder(OrderRequest request) {
+    Order order = orderRepository.save(new Order(request));
+    // Save event to outbox table IN THE SAME TRANSACTION
+    outboxRepository.save(new OutboxEvent("OrderCreated", order.getId()));
+    return order;
+    // A separate poller reads outbox table and publishes to Kafka
+    // This guarantees: if order is saved, event is also saved (same TX)
+}
+```
+
+### Interview Questions for Part 21
+
+**Q: Why can't you use @ManyToOne across microservices?**
+A: Because each service has its own database. JPA relationships require both tables to be in the same database. Cross-service data access uses REST APIs or events.
+
+**Q: What is the Saga pattern?**
+A: A sequence of local transactions across services, where each step either succeeds or triggers compensating actions to undo previous steps. Used instead of distributed transactions in microservices.
 
 ---
 

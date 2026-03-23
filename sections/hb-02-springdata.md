@@ -26,6 +26,35 @@ Spring's `@Transactional` annotation provides **declarative transaction manageme
 
 > **Critical Gotcha:** @Transactional does NOT work on `private` methods or when calling a @Transactional method from within the **same class** (self-invocation bypasses the proxy).
 
+### Deep Theory: Checked vs Unchecked Exception Rollback
+
+This catches even experienced developers off guard:
+
+```java
+// RuntimeException (unchecked) -> ROLLS BACK (expected)
+@Transactional
+public void method1() {
+    userRepository.save(user);
+    throw new RuntimeException("Error!"); // Transaction ROLLED BACK
+}
+
+// Checked Exception -> COMMITS! (unexpected!)
+@Transactional
+public void method2() throws IOException {
+    userRepository.save(user);
+    throw new IOException("Error!"); // Transaction COMMITTED! User is saved!
+}
+
+// Fix: Explicitly rollback for checked exceptions
+@Transactional(rollbackFor = Exception.class) // Rolls back for ANY exception
+public void method3() throws IOException {
+    userRepository.save(user);
+    throw new IOException("Error!"); // Now ROLLED BACK correctly
+}
+```
+
+**Best Practice:** Always use `@Transactional(rollbackFor = Exception.class)` in production code.
+
 ## 9.1 ACID Properties
 
 | Property | Meaning | Example |
@@ -35,6 +64,23 @@ Spring's `@Transactional` annotation provides **declarative transaction manageme
 | **Isolation** | Concurrent transactions don't interfere | Two users buying last item -- only one succeeds |
 | **Durability** | Committed data survives crashes | After commit, data persists even if server restarts |
 
+### Real-World ACID Scenario: Banking Transfer
+
+```java
+@Transactional(rollbackFor = Exception.class)
+public void transfer(Long fromId, Long toId, BigDecimal amount) {
+    Account from = accountRepo.findById(fromId)
+        .orElseThrow(() -> new AccountNotFoundException(fromId));
+    Account to = accountRepo.findById(toId)
+        .orElseThrow(() -> new AccountNotFoundException(toId));
+    
+    from.debit(amount);   // Atomicity: if this succeeds but credit fails...
+    to.credit(amount);    // ...both are rolled back (all or nothing)
+    // Isolation: concurrent transfer uses @Version (optimistic lock)
+    // Durability: once committed, even a server crash won't lose the data
+}
+```
+
 ## 9.2 Spring @Transactional
 
 ### When to Use @Transactional
@@ -43,9 +89,28 @@ Spring's `@Transactional` annotation provides **declarative transaction manageme
 - Methods that read data and need **snapshot consistency** (`readOnly = true`)
 
 ### When NOT to Use @Transactional
-- **Controller methods** — transactions should be scoped at the service layer
-- **Very long-running operations** — holding a transaction for minutes blocks database resources
-- **External API calls** within a transaction — the API call cannot be rolled back
+- **Controller methods** -- transactions should be scoped at the service layer
+- **Very long-running operations** -- holding a transaction for minutes blocks database resources
+- **External API calls** within a transaction -- the API call cannot be rolled back
+
+### Production Anti-Pattern: Calling External APIs Inside a Transaction
+
+```java
+// BAD: External API call inside transaction
+@Transactional
+public void processOrder(OrderRequest req) {
+    Order order = orderRepo.save(new Order(req));
+    paymentGateway.charge(req.getPaymentInfo()); // Takes 2-5 seconds!
+    // Transaction holds DB connection for 5+ seconds -> connection pool exhaustion!
+}
+
+// GOOD: Separate transaction from external call
+public void processOrder(OrderRequest req) {
+    Order order = createOrder(req);              // @Transactional (fast)
+    PaymentResult result = paymentGateway.charge(req); // No transaction
+    updateOrderPayment(order.getId(), result);   // @Transactional (fast)
+}
+```
 
 ```java
 @Service
@@ -96,6 +161,36 @@ Consider: An order placement method calls an audit logging method. If the order 
 | `NEVER` | Throw if transaction exists | Methods that must not run in a transaction |
 | `NESTED` | Create savepoint within existing | Partial rollbacks |
 
+### Deep Dive: REQUIRES_NEW vs NESTED
+
+```java
+// REQUIRES_NEW: Completely separate transaction
+// If inner fails, outer can still commit
+@Transactional
+public void placeOrder(OrderRequest req) {
+    Order order = orderRepo.save(new Order(req));
+    try {
+        notificationService.sendEmail(order); // REQUIRES_NEW
+    } catch (Exception e) {
+        log.error("Email failed, but order is still saved");
+    }
+}
+
+// NESTED: Savepoint within SAME transaction
+// If nested rolls back, outer can continue
+// But if outer rolls back, ALL nested changes also roll back
+@Transactional
+public void importBatch(List<Record> records) {
+    for (Record r : records) {
+        try {
+            processRecord(r); // NESTED: savepoint per record
+        } catch (Exception e) {
+            log.error("Record {} failed, skipping", r.getId());
+        }
+    }
+}
+```
+
 ```java
 @Transactional(propagation = Propagation.REQUIRES_NEW)
 public void logAuditEvent(String action, String details) {
@@ -107,6 +202,14 @@ public void logAuditEvent(String action, String details) {
 ```
 
 ## 9.4 Isolation Levels
+
+### Deep Theory: What Each Isolation Problem Looks Like
+
+**Dirty Read:** Transaction A reads uncommitted data from Transaction B. If B rolls back, A has read data that never existed.
+
+**Non-Repeatable Read:** Transaction A reads a row, Transaction B modifies it and commits. A reads again and gets different values.
+
+**Phantom Read:** Transaction A counts rows matching a condition. Transaction B inserts a new matching row. A counts again and gets a different count.
 
 | Level | Dirty Read | Non-Repeatable Read | Phantom Read | Performance |
 |---|---|---|---|---|
@@ -120,6 +223,8 @@ public void logAuditEvent(String action, String details) {
 public BigDecimal getAccountBalance(Long accountId) { ... }
 ```
 
+**Production Rule:** Use your database's default isolation level unless you have a specific reason to change. Use `@Version` (optimistic locking) instead of SERIALIZABLE for concurrency control.
+
 ## 9.5 Read-Only Transactions
 
 ```java
@@ -130,6 +235,23 @@ public List<User> getAllActiveUsers() {
     // Spring may route to read replica if configured
 }
 ```
+
+### Deep Theory: Three Benefits of readOnly = true
+
+1. **Hibernate optimization:** Skips dirty checking entirely (no entity snapshots stored, no field-by-field comparison at flush)
+2. **Database optimization:** Some databases optimize read-only connections (PostgreSQL can avoid WAL overhead)
+3. **Read replica routing:** Spring can route readOnly transactions to a database read replica using `AbstractRoutingDataSource`, reducing load on the primary
+
+### Interview Questions for Part 9
+
+**Q: Why does @Transactional NOT rollback on checked exceptions by default?**
+A: By Spring design, checked exceptions are considered "recoverable" and don't trigger rollback. Use `@Transactional(rollbackFor = Exception.class)` to override.
+
+**Q: What happens if you call a @Transactional method from within the same class?**
+A: The proxy is bypassed (self-invocation), so the second method runs without its own transaction. Fix: inject the bean into itself or extract to a separate service.
+
+**Q: When would you use REQUIRES_NEW propagation?**
+A: For operations that must succeed independently, such as audit logging, notification tracking, or metrics. Even if the business operation rolls back, the audit log persists.
 
 ---
 
@@ -202,6 +324,38 @@ public interface UserRepository extends JpaRepository<User, Long> {
 4. The proxy delegates to `SimpleJpaRepository` (default implementation)
 5. `SimpleJpaRepository` uses `EntityManager` internally
 
+### Deep Dive: What SimpleJpaRepository Does Internally
+
+```java
+// This is what Spring generates FOR YOU:
+public class SimpleJpaRepository<T, ID> implements JpaRepository<T, ID> {
+    
+    private final EntityManager em;
+    
+    @Transactional
+    public <S extends T> S save(S entity) {
+        if (isNew(entity)) {
+            em.persist(entity);   // New entity -> INSERT
+            return entity;
+        } else {
+            return em.merge(entity); // Existing entity -> UPDATE
+        }
+    }
+    
+    // isNew() checks: is entity.getId() == null?
+    // If yes -> persist(). If no -> merge().
+    // This is why @GeneratedValue matters!
+}
+```
+
+**Production Gotcha -- save() on Entity with Preset ID:**
+If you set the ID manually before calling `save()`, Spring thinks the entity already exists and calls `merge()` instead of `persist()`. This triggers a SELECT to check if the entity exists, then an INSERT -- resulting in 2 queries instead of 1. Fix: implement `Persistable<ID>` interface.
+
+### Interview Questions for Part 10
+
+**Q: How does Spring Data JPA decide whether to call persist() or merge() in save()?**
+A: It checks `isNew()` which by default checks if the entity's `@Id` field is null. Null ID means new entity -> persist(). Non-null ID means existing -> merge(). Override this by implementing `Persistable<ID>`.
+
 ---
 
 # Part 11: Spring Data JPA Architecture
@@ -264,6 +418,47 @@ public interface UserRepository extends JpaRepository<User, Long> {
 | ORM | Hibernate 6 | Object-relational mapping |
 | Connection Pool | HikariCP | JDBC connection management |
 | Database | PostgreSQL/MySQL | Data storage |
+
+### Deep Dive: Request Lifecycle Through the Stack
+
+```
+GET /api/users/1
+  |
+  v
+Controller: userService.getUser(1)
+  |
+  v
+Spring AOP Proxy intercepts @Transactional
+  -> Obtains Connection from HikariCP pool
+  -> Sets autocommit = false
+  -> Binds Connection to ThreadLocal
+  |
+  v
+Service calls userRepository.findById(1)
+  |
+  v
+Spring Data proxy delegates to SimpleJpaRepository.findById()
+  -> Calls entityManager.find(User.class, 1)
+  |
+  v
+Hibernate checks 1st level cache (Persistence Context)
+  -> Cache MISS -> generates SQL via Dialect
+  -> SELECT u.* FROM users u WHERE u.id = ?
+  |
+  v
+JDBC PreparedStatement executes on physical Connection
+  -> ResultSet returned
+  -> Hibernate maps to User entity
+  -> Stores in Persistence Context (1st level cache)
+  |
+  v
+Service returns UserDTO
+  -> AOP Proxy calls Connection.commit()
+  -> Connection returned to HikariCP pool
+  |
+  v
+Controller returns ResponseEntity<UserDTO> as JSON
+```
 
 ---
 
@@ -329,6 +524,14 @@ public interface ProductRepository extends JpaRepository<Product, Long> {
 | `PagingAndSortingRepository` | Need pagination but no JPA features |
 | `JpaRepository` | Default choice for Spring Boot apps |
 
+### Interview Questions for Part 12
+
+**Q: What is the difference between CrudRepository and JpaRepository?**
+A: JpaRepository extends CrudRepository and adds JPA-specific methods: `flush()`, `saveAndFlush()`, `deleteAllInBatch()`, and full pagination support. Always use JpaRepository in Spring Boot.
+
+**Q: Why does deleteAllInBatch() exist alongside deleteAll()?**
+A: `deleteAll()` loads all entities first, then deletes each one individually (N queries). `deleteAllInBatch()` executes a single `DELETE FROM table` SQL (1 query). For large tables, batch is orders of magnitude faster.
+
 ---
 
 # Part 13: Query Methods in Spring Data JPA
@@ -343,6 +546,25 @@ Spring Data JPA provides three strategies for creating queries, from simplest to
 | **Native query** | Database-specific features, complex analytics | `@Query(value = "SELECT...", nativeQuery = true)` |
 
 > **Rule of Thumb:** Start with derived queries. Move to @Query when method names become unreadable (more than 3 conditions). Use native queries only when you need database-specific syntax.
+
+### Deep Theory: How Spring Data Derives Queries From Method Names
+
+At startup, Spring Data parses each method name into tokens:
+
+```
+findByStatusAndRoleOrderByNameAsc
+  |       |     |      |      |
+  v       v     v      v      v
+ find   Status  And   Role   OrderBy Name Asc
+  |       |           |      |
+  v       v           v      v
+SELECT  WHERE status= AND role=  ORDER BY name ASC
+
+Generated JPQL:
+SELECT u FROM User u WHERE u.status = ?1 AND u.role = ?2 ORDER BY u.name ASC
+```
+
+**If Spring Data cannot parse the method name, the application fails to start** (fail-fast). This is actually a feature -- it catches query typos at startup rather than at runtime.
 
 ## 13.1 Method Name Query Derivation
 
@@ -414,6 +636,10 @@ public interface UserRepository extends JpaRepository<User, Long> {
 
 # Part 14: Custom Queries
 
+### Deep Theory: Why @Query Exists
+
+Derived query methods work great for 1-3 conditions. But when you need JOINs, GROUP BY, subqueries, or when the method name becomes `findByStatusAndRoleAndDepartmentAndSalaryGreaterThanAndCreatedAtAfter`, it's time for `@Query`. The query is validated at startup -- if you have a JPQL syntax error, the application fails to start.
+
 ## 14.1 @Query with JPQL
 
 ```java
@@ -448,6 +674,17 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
 }
 ```
 
+### Production Warning: @Modifying Requires clearAutomatically
+
+When you use `@Modifying` with `@Query` for UPDATE/DELETE, the persistence context is NOT automatically cleared. Entities loaded before the bulk operation still show old values!
+
+```java
+@Modifying(clearAutomatically = true) // CRITICAL: clear stale cache
+@Transactional
+@Query("UPDATE Order o SET o.status = :newStatus WHERE ...")
+int bulkUpdateStatus(...);
+```
+
 ## 14.2 Native Queries
 
 ```java
@@ -474,6 +711,16 @@ List<Object[]> getDailyRevenue(@Param("startDate") LocalDate startDate);
 ---
 
 # Part 15: Pagination and Sorting
+
+### Deep Theory: Why Pagination is Non-Negotiable in Production
+
+Without pagination, `findAll()` on a table with 1 million rows loads ALL rows into memory -> OutOfMemoryError, or at minimum, a 30-second response time. Every list endpoint in production MUST be paginated.
+
+**Pagination generates TWO SQL queries:**
+1. `SELECT ... LIMIT 20 OFFSET 40` (fetch the page data)
+2. `SELECT COUNT(*) FROM ...` (total count for pagination metadata)
+
+The COUNT query can be expensive on large tables. For infinite-scroll UIs, use `Slice<T>` instead of `Page<T>` to skip the count query.
 
 ## 15.1 Pageable
 
@@ -610,5 +857,28 @@ public Page<Product> searchProducts(ProductSearchRequest req, Pageable pageable)
     return productRepository.findAll(spec, pageable);
 }
 ```
+
+### Performance Tip: Avoid N+1 with Specifications
+
+Specifications generate JPQL that can trigger N+1 if the matched entities have LAZY associations that you access later. Combine Specifications with `@EntityGraph` or a custom `Specification` that adds a `JOIN FETCH`:
+
+```java
+public static Specification<Product> fetchCategory() {
+    return (root, query, cb) -> {
+        if (query.getResultType() != Long.class) { // Skip for COUNT queries
+            root.fetch("category", JoinType.LEFT);
+        }
+        return null;
+    };
+}
+```
+
+### Interview Questions for Part 16
+
+**Q: When should you use Specifications vs derived query methods?**
+A: Use Specifications when you have dynamic, optional filters that combine at runtime (search pages with multiple checkboxes). Use derived methods for fixed, simple queries.
+
+**Q: Can you combine Specifications with pagination?**
+A: Yes. Pass both `Specification<T>` and `Pageable` to `repository.findAll(spec, pageable)`. The Specification handles WHERE clauses, Pageable handles LIMIT/OFFSET/ORDER BY.
 
 ---

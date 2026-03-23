@@ -92,6 +92,29 @@ list.remove(2);
 | `size()` | O(1) | Returns field value |
 | `isEmpty()` | O(1) | Checks size == 0 |
 
+### Deep Theory: ArrayList Resize Cost Analysis
+
+```
+Growth Pattern (starting from default capacity 10):
+Capacity:  10 -> 15 -> 22 -> 33 -> 49 -> 73 -> 109 -> 163 -> 244 -> ...
+
+To store 1,000,000 elements:
+- Number of resizes: ~44 times
+- Total elements copied across all resizes: ~2,000,000 (2x total elements)
+- Amortized cost per add(): O(1) -- despite O(n) individual resizes
+
+Pre-sizing avoidance:
+new ArrayList<>(1_000_000)  -- ZERO resizes, ZERO copies
+new ArrayList<>()          -- 44 resizes, 2M copies
+```
+
+**Production Rule:** Always pre-size ArrayList when you know or can estimate the size:
+```java
+// Converting database results -- you know the size!
+List<DTO> dtos = new ArrayList<>(entities.size()); // Pre-sized
+for (Entity e : entities) { dtos.add(toDTO(e)); }
+```
+
 ### Thread Safety
 **ArrayList is NOT thread-safe.** For concurrent access:
 ```java
@@ -227,7 +250,30 @@ list.get(5);
 ### When NOT to Use LinkedList
 - Random access patterns (use ArrayList instead)
 - Memory-constrained environments (each element has ~40 bytes overhead for Node object)
-- Cache performance matters (non-contiguous memory layout → poor CPU cache utilization)
+- Cache performance matters (non-contiguous memory layout -- poor CPU cache utilization)
+
+### Deep Theory: The CPU Cache Problem with LinkedList
+
+```
+ArrayList in Memory:    [A][B][C][D][E][F][G][H]  -- contiguous
+  CPU cache line (64 bytes) loads multiple elements at once
+  Access pattern: predictable, sequential -- CPU prefetcher loves this
+
+LinkedList in Memory:   [A]-->[somewhere in heap][B]-->[elsewhere][C]...
+  Each Node is a separate heap allocation
+  Access pattern: random jumps -- CPU prefetcher cannot predict
+  Result: cache miss on almost every node access
+```
+
+**Benchmark Reality:** Even for operations where LinkedList has O(1) complexity (like insertion at a known iterator position), ArrayList is often faster in practice due to CPU cache effects -- up to 10x faster for sequential access patterns.
+
+### Interview Questions for List Implementations
+
+**Q: A developer says "I use LinkedList because insertion is O(1)". Is that correct?**
+A: Partially. Insertion at a KNOWN position (via iterator) is O(1). But finding that position is O(n). In practice, most insertions require finding the position first, making it O(n). ArrayList's O(n) shift operation uses `System.arraycopy()` (native memcpy), which is extremely fast due to cache locality.
+
+**Q: When would you actually use LinkedList in production?**
+A: Almost never as a List. The only valid use is as a `Deque` (double-ended queue) when you need both `addFirst()` and `addLast()` O(1). But even then, `ArrayDeque` is faster. LinkedList's real niche: when you need to remove elements during iteration using `Iterator.remove()` without shifting.
 
 ---
 
@@ -350,6 +396,24 @@ public class EventPublisher {
 | `contains(o)` | O(n) - Linear scan |
 | Iteration | O(n) - Snapshot, no ConcurrentModificationException |
 
+### Deep Theory: Why CopyOnWriteArrayList Iterators Never Throw CME
+
+```
+Thread A (reading):              Thread B (writing):
+iterator = list.iterator()       list.add("X")
+  |-- snapshot = array@v1          |-- creates new array@v2
+  |-- iterating over array@v1      |-- array@v2 = copy + "X"
+  |-- sees: [A, B, C]             |-- list.array = array@v2
+  |-- NEVER sees "X"              
+  |-- NO CME thrown               
+
+Key: iterator holds reference to OLD array snapshot
+New writes create entirely new arrays
+Old array is eventually GC'd when iterator finishes
+```
+
+**Warning:** CopyOnWriteArrayList is TERRIBLE for write-heavy workloads. Adding 1000 elements to a list of 10,000 creates 1000 array copies of ~10,000 elements each = 10 million element copies!
+
 ---
 
 # Chapter 4: Set Implementations Deep Dive
@@ -427,6 +491,26 @@ public class Employee {
 | `remove(o)` | O(1) | O(n) |
 | `contains(o)` | O(1) | O(n) |
 | Iteration | O(n + capacity) | O(n + capacity) |
+
+### Deep Theory: Why HashSet Uniqueness Can Silently Break
+
+```java
+// DANGEROUS: Mutable object in HashSet
+List<String> list1 = new ArrayList<>(Arrays.asList("A"));
+Set<List<String>> set = new HashSet<>();
+set.add(list1);
+
+System.out.println(set.contains(list1)); // true
+
+list1.add("B"); // Mutating the element AFTER adding to set!
+
+System.out.println(set.contains(list1)); // FALSE! hashCode changed!
+// The element is STILL in the set, but in the wrong bucket
+// It's a phantom entry -- you can't find it, can't remove it
+// It stays in memory until the set is garbage collected
+```
+
+**Production Rule:** Objects stored in HashSet (or used as HashMap keys) must be effectively immutable. Use `String`, `Integer`, `Long`, `enum`, or immutable records.
 
 ---
 
@@ -511,6 +595,32 @@ public class TreeSet<E> extends AbstractSet<E>
 | `first()` / `last()` | O(log n) |
 | `lower()` / `higher()` | O(log n) |
 | `floor()` / `ceiling()` | O(log n) |
+
+### Deep Theory: Comparable vs Comparator Trap in TreeSet
+
+```java
+// TRAP: TreeSet uses compareTo() for EQUALITY, not equals()
+TreeSet<String> set = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+set.add("Hello");
+set.add("hello"); // NOT added! compareTo returns 0 ("equal" by comparator)
+System.out.println(set.size()); // 1!
+
+// This means TreeSet's behavior depends on the Comparator
+// Two objects are "equal" in TreeSet if compare() returns 0
+// Even if equals() returns false
+
+// Production impact: sorting by just one field can silently drop duplicates
+TreeSet<Employee> byName = new TreeSet<>(Comparator.comparing(Employee::getName));
+// If two employees have same name, only ONE is kept!
+```
+
+**Fix:** Use a tiebreaker in the comparator:
+```java
+TreeSet<Employee> safe = new TreeSet<>(
+    Comparator.comparing(Employee::getName)
+              .thenComparing(Employee::getId) // Ensures uniqueness
+);
+```
 
 ### Enterprise Usage
 ```java
@@ -708,6 +818,36 @@ public List<Product> getTopNExpensiveProducts(List<Product> products, int n) {
     return new ArrayList<>(minHeap);
 }
 ```
+
+### Deep Theory: PriorityQueue is NOT Sorted
+
+A common misconception: PriorityQueue does NOT maintain elements in sorted order. Only the HEAD is guaranteed to be the minimum:
+
+```java
+PriorityQueue<Integer> pq = new PriorityQueue<>();
+pq.addAll(List.of(5, 1, 3, 4, 2));
+
+// Internal array might be: [1, 2, 3, 5, 4] -- NOT sorted!
+// Only pq.peek() = 1 is guaranteed to be minimum
+
+// To get sorted output, you MUST drain the queue:
+while (!pq.isEmpty()) {
+    System.out.print(pq.poll() + " "); // 1 2 3 4 5 (sorted!)
+}
+
+// Common mistake: iterating PriorityQueue directly
+for (int x : pq) { ... } // NOT in sorted order!
+```
+
+**Production Tip:** Use PriorityQueue when you only need the min/max element repeatedly (scheduling, top-N). If you need all elements sorted, use `TreeSet` or sort a `List`.
+
+### Interview Questions for Queue/Deque Implementations
+
+**Q: What is the time complexity of PriorityQueue.remove(Object)?**
+A: O(n). It performs a linear search to find the element, then O(log n) sift operation. Unlike `poll()` which is O(log n) because it always removes the head.
+
+**Q: Why does ArrayDeque use a power-of-2 array size?**
+A: To enable bitwise AND for index wrapping: `index & (length - 1)` instead of `index % length`. Bitwise AND is ~10x faster than modulo on most CPUs.
 
 ---
 

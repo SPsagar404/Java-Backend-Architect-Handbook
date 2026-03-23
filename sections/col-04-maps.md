@@ -74,6 +74,27 @@ public class InMemoryCacheService<K, V> {
 }
 ```
 
+### Deep Theory: HashMap Initial Capacity Calculation
+
+```java
+// The CORRECT formula to avoid ANY resizing:
+int expectedSize = 1000;
+int capacity = (int)(expectedSize / 0.75f) + 1; // = 1334
+Map<K,V> map = new HashMap<>(capacity);
+
+// But HashMap rounds UP to the nearest power of 2:
+// 1334 -> 2048 (next power of 2)
+// So you get capacity=2048, threshold=1536, which comfortably holds 1000
+
+// Java 19+ provides a convenience method:
+Map<K,V> map = HashMap.newHashMap(expectedSize); // Does the math for you
+
+// WRONG: Common mistake
+Map<K,V> map = new HashMap<>(1000); // Threshold = 750, resizes at 750 entries!
+```
+
+**Production Impact:** A HashMap created to hold 10,000 entries with default capacity will resize 10 times (16->32->...->16384). Each resize rehashes ALL entries. Pre-sizing eliminates this completely.
+
 ---
 
 ## 6.2 LinkedHashMap
@@ -128,6 +149,23 @@ public class SessionCacheService {
     }
 }
 ```
+
+### Deep Theory: Access-Order LinkedHashMap for Production LRU Caches
+
+```
+Key insight: removeEldestEntry() is called AFTER every put() operation.
+
+Flow when accessOrder=true and maxSize=3:
+
+put(A)  -> [A]           removeEldestEntry? size=1 <= 3, no
+put(B)  -> [A, B]        removeEldestEntry? size=2 <= 3, no
+put(C)  -> [A, B, C]     removeEldestEntry? size=3 <= 3, no
+get(A)  -> [B, C, A]     A moves to tail (most recently accessed)
+put(D)  -> [C, A, D]     removeEldestEntry? size=4 > 3, YES -> removes B (head)
+                          B was least recently accessed
+```
+
+**Thread Safety Warning:** LinkedHashMap is NOT thread-safe. Always wrap with `Collections.synchronizedMap()` or use `ConcurrentHashMap` with manual LRU tracking.
 
 ---
 
@@ -261,6 +299,45 @@ public class MetricsService {
     }
 }
 ```
+
+### Deep Theory: ConcurrentHashMap Cooperative Resize (Transfer)
+
+```
+When ConcurrentHashMap needs to resize:
+
+1. Thread A triggers resize, creates new table (2x capacity)
+2. Thread A sets transferIndex = old table length
+3. Thread A starts migrating bins from right to left
+
+4. Thread B tries to put() into a bin being migrated
+5. Thread B sees ForwardingNode marker in old table
+6. Thread B HELPS with migration (steals a chunk of bins)
+
+7. Thread C tries to get() from a migrated bin
+8. Thread C follows ForwardingNode to new table (no blocking!)
+
+Result: Resize is parallelized across multiple threads.
+Reads NEVER block during resize.
+```
+
+**Why ConcurrentHashMap forbids null keys/values:**
+```java
+// With null values, you can't distinguish between:
+map.get("key") == null  // Does key not exist? Or is value null?
+
+// HashMap solves this with containsKey(), but ConcurrentHashMap can't:
+// Between containsKey() and get(), another thread might modify the map
+// This race condition is unsolvable with null values
+// So ConcurrentHashMap simply forbids them
+```
+
+### Interview Questions for Map Implementations
+
+**Q: Why is HashMap capacity always a power of 2?**
+A: So that `hash & (capacity - 1)` can be used instead of `hash % capacity`. Bitwise AND is a single CPU instruction, while modulo requires division -- about 20x slower. Power-of-2 ensures `capacity - 1` produces a bitmask (e.g., 15 = 0000 1111).
+
+**Q: A HashMap with 10M entries is taking 800MB of memory. How do you optimize?**
+A: 1) Pre-size to avoid resize copies. 2) Use primitive-specialized maps (Eclipse Collections IntObjectHashMap). 3) Use DTO/record keys instead of complex objects. 4) Consider off-heap storage (Chronicle Map). 5) Use WeakHashMap if entries can be GC'd. 6) Evaluate if all 10M entries need to be in memory.
 
 ---
 
@@ -531,6 +608,33 @@ static final int hash(Object key) {
     // null → hash = 0 → bucket index = 0
 }
 ```
+
+### Deep Theory: HashMap Java 7 Infinite Loop Bug
+
+In Java 7, HashMap used **head insertion** during resize. Under concurrent access, this could create a circular linked list:
+
+```
+Before resize: bucket[5] -> A -> B -> null
+
+Thread 1 starts resize:     Thread 2 starts resize:
+  Reads A.next = B            Reads A.next = B
+  Inserts B at head           Inserts B at head  
+  Then inserts A at head      Then inserts A at head
+  
+Result: A.next = B, B.next = A  -- INFINITE LOOP!
+
+Any subsequent get() that hits this bucket hangs the CPU at 100%.
+```
+
+**Java 8 fix:** Uses **tail insertion** -- new entries are appended to the end of the chain. This maintains order and prevents circular references. However, HashMap is still NOT thread-safe. Always use ConcurrentHashMap for concurrent access.
+
+### Interview Questions for HashMap/TreeMap Internals
+
+**Q: Walk through what happens internally when you call `map.get("hello")` on a HashMap with 1 million entries.**
+A: 1) Compute hash: `"hello".hashCode() ^ (hashCode >>> 16)`. 2) Find bucket: `hash & (table.length - 1)`. 3) If bucket is empty, return null. 4) If first node's key matches (by hash AND equals), return its value. 5) If first node is TreeNode, search the Red-Black tree in O(log n). 6) Otherwise, traverse the linked list comparing each node. Total: O(1) average, O(log n) worst case.
+
+**Q: How does ConcurrentHashMap.size() work without locking?**
+A: It uses a `baseCount` field updated via CAS plus a `CounterCell[]` array (similar to `LongAdder`). Under contention, each thread increments its own CounterCell, avoiding a bottleneck. `size()` sums `baseCount + all CounterCells`. This is an eventually-consistent count.
 
 ---
 

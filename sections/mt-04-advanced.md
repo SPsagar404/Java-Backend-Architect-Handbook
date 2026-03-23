@@ -177,6 +177,102 @@ public void transfer(Account from, Account to, double amount) {
 }
 ```
 
+## 13.6 Livelock — The Invisible Deadlock
+
+A **livelock** is when threads keep responding to each other but make **no progress**. Unlike a deadlock (threads are frozen), a livelock has threads actively running but doing useless work.
+
+```java
+// Real-world analogy: Two people in a hallway keep stepping aside for each other
+// Both are "active" but neither makes progress
+
+// Code Example: Livelock in a transfer system
+public boolean transfer(Account from, Account to, BigDecimal amount) {
+    while (true) {
+        if (from.getLock().tryLock()) {
+            try {
+                if (to.getLock().tryLock()) {
+                    try {
+                        from.debit(amount);
+                        to.credit(amount);
+                        return true;
+                    } finally {
+                        to.getLock().unlock();
+                    }
+                }
+            } finally {
+                from.getLock().unlock();
+            }
+        }
+        // Both threads reach here simultaneously, retry, clash again = LIVELOCK!
+    }
+}
+
+// FIX: Add random backoff
+if (!to.getLock().tryLock()) {
+    from.getLock().unlock();
+    Thread.sleep(ThreadLocalRandom.current().nextInt(1, 10));  // Random backoff
+}
+```
+
+```
+Deadlock vs Livelock vs Starvation:
+────────────────────────────────────
+  Deadlock:    Threads FROZEN, waiting for each other
+               → CPU idle, detected by jstack/ThreadMXBean
+  
+  Livelock:    Threads ACTIVE, but doing useless work repeatedly
+               → CPU busy, harder to detect (looks like working!)
+  
+  Starvation:  Thread never gets CPU time or lock access
+               → Usually caused by unfair locks + high-priority threads
+               → Fix: use fair locks (new ReentrantLock(true))
+```
+
+## 13.7 Thread Leak Detection
+
+A **thread leak** is when threads are created but never properly terminated. Over time, the JVM runs out of OS threads and crashes.
+
+```java
+// Common causes of thread leaks:
+// 1. ExecutorService never shut down
+// 2. Daemon threads with infinite loops and no interrupt check
+// 3. Thread pools created inside methods (new pool per request!)
+
+// Detection: Monitor thread count over time
+@Scheduled(fixedRate = 60000)
+public void detectThreadLeak() {
+    int threadCount = Thread.activeCount();
+    log.info("Active threads: {}", threadCount);
+    
+    if (threadCount > 500) {
+        log.error("THREAD LEAK DETECTED! {} active threads", threadCount);
+        // Take thread dump for analysis
+        ThreadMXBean bean = ManagementFactory.getThreadMXBean();
+        ThreadInfo[] infos = bean.dumpAllThreads(true, true);
+        for (ThreadInfo info : infos) {
+            log.error(info.toString());
+        }
+    }
+}
+```
+
+### Deadlock Prevention Checklist (Code Review)
+
+```
+Code Review Checklist for Lock Safety:
+────────────────────────────────────────
+☐ Do all locks have a consistent global ordering?
+☐ Are all lock acquisitions wrapped in try-finally with unlock()?
+☐ Are there timeouts on all lock acquisitions (tryLock with timeout)?
+☐ Are nested locks minimized or eliminated?
+☐ Are external calls (REST, DB) made outside of lock scope?
+☐ Are thread pools properly shut down in @PreDestroy?
+☐ Are ThreadLocal values cleaned up with remove()?
+☐ Are all executors using bounded queues?
+☐ Is there monitoring for active threads and queue depth?
+☐ Are InterruptedExceptions handled properly (not swallowed)?
+```
+
 ---
 
 # Chapter 14: Thread Safety Design Patterns
@@ -424,6 +520,125 @@ public class GuardedQueue<T> {
         }
     }
 }
+```
+
+## 14.6 Immutability with Java Records (Java 16+)
+
+Java Records provide the most concise way to create immutable data carriers:
+
+```java
+// Before Records: verbose immutable class
+public final class OrderEvent {
+    private final String orderId;
+    private final BigDecimal amount;
+    private final Instant timestamp;
+    
+    public OrderEvent(String orderId, BigDecimal amount, Instant timestamp) {
+        this.orderId = orderId;
+        this.amount = amount;
+        this.timestamp = timestamp;
+    }
+    // + getters, equals, hashCode, toString (50+ lines)
+}
+
+// With Records: inherently immutable, thread-safe by design
+public record OrderEvent(
+    String orderId,
+    BigDecimal amount,
+    Instant timestamp
+) {
+    // Compact constructor for validation:
+    public OrderEvent {
+        Objects.requireNonNull(orderId, "orderId must not be null");
+        if (amount.compareTo(BigDecimal.ZERO) < 0)
+            throw new IllegalArgumentException("amount must be >= 0");
+    }
+}
+
+// Thread-safe by design:
+// • All fields are final (immutable)
+// • No setters (state can't change)
+// • Can be freely shared between threads without synchronization
+// • Perfect for event objects, DTOs, and message payloads
+```
+
+## 14.7 Lock-Free State Management with AtomicReference
+
+```java
+// Pattern: Atomic configuration updates without locks
+public class DynamicConfig {
+    
+    // Immutable config record
+    public record AppConfig(int maxRetries, Duration timeout, boolean featureFlag) {}
+    
+    private final AtomicReference<AppConfig> config;
+    
+    public DynamicConfig(AppConfig initialConfig) {
+        this.config = new AtomicReference<>(initialConfig);
+    }
+    
+    // Thread-safe read (no lock needed)
+    public AppConfig getConfig() {
+        return config.get();  // Volatile read
+    }
+    
+    // Thread-safe update (CAS, no lock needed)
+    public void updateTimeout(Duration newTimeout) {
+        config.updateAndGet(current -> 
+            new AppConfig(current.maxRetries(), newTimeout, current.featureFlag()));
+    }
+    
+    // Thread-safe conditional update
+    public boolean enableFeature() {
+        return config.compareAndSet(
+            config.get(),  // expected
+            new AppConfig(config.get().maxRetries(), config.get().timeout(), true)
+        );
+    }
+}
+
+// This pattern is used by:
+//  - Spring Cloud Config refresh
+//  - Feature flag systems (LaunchDarkly, Unleash)
+//  - Dynamic routing tables
+```
+
+## 14.8 Thread-Safe Builder Pattern
+
+```java
+// Builder pattern is inherently thread-safe when used correctly:
+// The builder itself is NOT shared — each thread creates its own builder
+// The built object is immutable — safe to share across threads
+
+public record HttpRequest(
+    String url, String method, Map<String, String> headers, byte[] body
+) {
+    public static Builder builder() { return new Builder(); }
+    
+    public static class Builder {
+        private String url;
+        private String method = "GET";
+        private final Map<String, String> headers = new HashMap<>();
+        private byte[] body;
+        
+        public Builder url(String url) { this.url = url; return this; }
+        public Builder method(String method) { this.method = method; return this; }
+        public Builder header(String k, String v) { headers.put(k, v); return this; }
+        public Builder body(byte[] body) { this.body = body; return this; }
+        
+        public HttpRequest build() {
+            return new HttpRequest(
+                url, method,
+                Collections.unmodifiableMap(new HashMap<>(headers)),  // Defensive copy!
+                body != null ? body.clone() : null  // Defensive copy!
+            );
+        }
+    }
+}
+
+// Thread-safety guarantee:
+// Builder is created and used by a SINGLE thread (no sharing needed)
+// HttpRequest record is immutable (safe to share across any threads)
 ```
 
 ---
@@ -689,6 +904,84 @@ WebClient.create(url)
    → active threads, queue size, rejected tasks, completion time
 ```
 
+## 16.4 Reactive Programming vs Multithreading
+
+```
+Comparison: When to Use Which
+────────────────────────────────
+
+                      Traditional Multithreading    Reactive (WebFlux/RxJava)
+ Thread per request:  1 thread = 1 request           1 thread = 1000s of requests
+ Memory usage:        ~1MB per thread (stack)         ~KB per subscription
+ Blocking IO:         Thread sleeps during IO         Event loop continues
+ Programming model:   Imperative (familiar)           Declarative (learning curve)
+ Debugging:           Stack traces are clear           Stack traces are cryptic
+ Error handling:      try-catch (familiar)             onError operators
+ Ecosystem support:   Spring MVC (mature)              Spring WebFlux (growing)
+ Best for:            CPU-bound, simple IO             High-concurrency IO-bound
+ Throughput ceiling:  ~10K concurrent (thread limit)   ~100K+ concurrent
+
+Decision Framework:
+  1. < 500 concurrent connections → Use traditional threads + Spring MVC
+  2. 500-5000 concurrent → Consider virtual threads (Java 21) first
+  3. > 5000 concurrent IO-bound → Consider reactive (WebFlux)
+  4. CPU-bound workloads → Always traditional threads
+  5. Team familiarity matters → Choose what your team can debug!
+```
+
+## 16.5 Virtual Threads Deep Dive (Project Loom, Java 21+)
+
+```java
+// Virtual threads fundamentally change the threading model:
+
+// OLD MODEL: 1 platform thread per request (limited to ~10K concurrent)
+@Configuration
+public class TomcatConfig {
+    // server.tomcat.threads.max=200  (OS THREAD LIMIT)
+}
+
+// NEW MODEL: 1 virtual thread per request (millions possible)
+// application.properties:
+// spring.threads.virtual.enabled=true  (Spring Boot 3.2+)
+
+// What happens internally:
+// 1. Virtual thread starts on a carrier (platform) thread
+// 2. When virtual thread hits blocking IO (JDBC, HTTP, file read):
+//    - Virtual thread is UNMOUNTED from carrier
+//    - Carrier thread is FREE to run other virtual threads
+// 3. When IO completes:
+//    - Virtual thread is MOUNTED on any available carrier
+//    - Execution continues seamlessly
+
+// Diagram:
+// Carrier threads (platform):  [C1] [C2] [C3] [C4]  (= CPU cores)
+// Virtual threads:             [V1] [V2] [V3] ... [V1000000]
+// 
+// V1 runs on C1 → V1 blocks on IO → V1 unmounts → C1 picks up V47
+// V1's IO completes → V1 mounts on C3 (any free carrier) → continues
+```
+
+```
+Virtual Thread Caveats:
+────────────────────────
+
+1. PINNING: Virtual threads PIN to carrier when inside:
+   - synchronized blocks/methods (cannot unmount!)
+   - JNI/native code
+   FIX: Replace synchronized with ReentrantLock
+
+2. ThreadLocal: Works but each virtual thread gets its own copy
+   Risk: 1 million virtual threads = 1 million ThreadLocal copies = OOM
+   FIX: Use ScopedValue (Java 21 preview) instead of ThreadLocal
+
+3. CPU-bound work: Virtual threads offer NO benefit
+   They only help when threads spend most time WAITING (IO)
+
+4. Thread pools: DON'T pool virtual threads
+   They are cheap to create — just create a new one per task
+   Use: Executors.newVirtualThreadPerTaskExecutor()
+```
+
 ---
 
 # Chapter 17: Common Production Issues
@@ -765,6 +1058,89 @@ CompletableFuture.supplyAsync(() -> {
 CompletableFuture.supplyAsync(() -> {
     return restTemplate.getForObject(url, Data.class);
 }, ioExecutor); // IO pool designed for blocking calls
+```
+
+## 17.5 Production Thread Debugging Toolkit
+
+### jcmd — The Modern Alternative to jstack
+
+```
+Production debugging commands:
+──────────────────────────────
+
+$ jcmd <PID> Thread.print              # Thread dump (like jstack, but better)
+$ jcmd <PID> Thread.dump_to_file <f>   # Dump to file (Java 21+)
+$ jcmd <PID> VM.native_memory summary  # Native memory usage
+$ jcmd <PID> GC.heap_dump <file>       # Heap dump
+$ jcmd <PID> VM.uptime                 # JVM uptime
+$ jcmd <PID> VM.flags                  # All JVM flags
+
+Java Flight Recorder (JFR) — Zero-overhead production profiling:
+$ jcmd <PID> JFR.start name=recording duration=60s filename=recording.jfr
+$ jcmd <PID> JFR.stop name=recording
+
+Analyze JFR recording:
+$ jfr print --events jdk.ThreadPark recording.jfr   # Thread parking events
+$ jfr print --events jdk.JavaMonitorWait recording.jfr  # Lock wait events
+
+Or use JDK Mission Control (jmc) GUI for visual analysis.
+```
+
+### Thread Dump Analysis Methodology (Step-by-Step)
+
+```
+5-Step Thread Dump Analysis:
+───────────────────────────────
+
+1. TAKE MULTIPLE DUMPS (3 dumps, 10 seconds apart)
+   $ for i in 1 2 3; do jstack <PID> > dump_$i.txt; sleep 10; done
+
+2. LOOK FOR DEADLOCKS (auto-detected by jstack)
+   Search for: "Found one Java-level deadlock"
+
+3. COUNT THREAD STATES
+   $ grep "java.lang.Thread.State:" dump_1.txt | sort | uniq -c
+     150 RUNNABLE          ← threads doing work or blocking on IO
+      35 WAITING (parking)  ← idle pool threads (normal)
+      15 BLOCKED            ← waiting for locks (problem if high)
+       5 TIMED_WAITING      ← sleeping or waiting with timeout
+
+4. IDENTIFY STUCK THREADS
+   Compare dump_1, dump_2, dump_3:
+   Thread in SAME STATE + SAME STACK in ALL 3 dumps = STUCK
+
+5. FIND THE ROOT CAUSE
+   For BLOCKED threads: follow the chain
+     Thread-3 waiting for lock → held by Thread-1 → Thread-1 is doing what?
+   For RUNNABLE but stuck (IO):
+     Look at bottom of stack: SocketInputStream.read() = waiting on network
+```
+
+### Connection Pool Starvation Diagnosis
+
+```java
+// Symptom: All requests timeout, but CPU is low
+// Root cause: All HikariCP connections are checked out, new requests wait forever
+
+// Detection: HikariCP metrics
+@Bean
+public MeterBinder hikariMetrics(HikariDataSource ds) {
+    return registry -> {
+        Gauge.builder("hikari.active", ds, HikariDataSource::getHikariPoolMXBean)
+             .description("Active connections").register(registry);
+        Gauge.builder("hikari.pending", ds.getHikariPoolMXBean(),
+             HikariPoolMXBean::getThreadsAwaitingConnection)
+             .description("Threads waiting for connection").register(registry);
+    };
+}
+
+// Prevention:
+// spring.datasource.hikari.maximum-pool-size=20
+// spring.datasource.hikari.connection-timeout=5000  (fail fast, don't hang)
+// spring.datasource.hikari.leak-detection-threshold=10000  (detect leaks!!)
+//
+// When leak-detection-threshold is set, HikariCP logs a WARNING if a connection
+// is held for more than 10 seconds — this catches forgotten close() calls.
 ```
 
 ---

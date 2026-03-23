@@ -55,7 +55,13 @@ combined = combined
     .replace(/─/g, '-').replace(/│/g, '|').replace(/┼/g, '+')
     .replace(/←/g, '<-').replace(/→/g, '->').replace(/↓/g, 'v').replace(/↑/g, '^')
     .replace(/►/g, '>').replace(/◄/g, '<')
-    .replace(/×/g, 'x');
+    .replace(/×/g, 'x')
+    .replace(/☆/g, '*').replace(/⭐/g, '*')
+    .replace(/✓/g, '[Y]').replace(/✗/g, '[N]').replace(/✅/g, '[Y]').replace(/❌/g, '[N]')
+    .replace(/☐/g, '[ ]').replace(/☑/g, '[x]')
+    .replace(/≈/g, '~=').replace(/≤/g, '<=').replace(/≥/g, '>=')
+    .replace(/•/g, '-').replace(/μ/g, 'u')
+    .replace(/✘/g, '[N]').replace(/✔/g, '[Y]');
 
 fs.writeFileSync(path.join(dir, 'Java-Multithreading-Mastering-Guide.md'), combined, 'utf8');
 console.log('Combined file written successfully with frontmatter and fixed characters.');

@@ -85,6 +85,57 @@ Need auto-cleanup of unused keys?   → WeakHashMap
 | Null elements | No | No | Yes |
 | Memory | Array-based | Array-based | Node-based |
 
+### Deep Theory: The Collection Selection Decision Matrix
+
+```
+Step 1: Do you need key-value pairs?
+  YES --> Map family
+    Need sorted keys? --> TreeMap
+    Need insertion order? --> LinkedHashMap
+    Need thread safety? --> ConcurrentHashMap
+    Otherwise --> HashMap
+  NO --> Collection family
+
+Step 2: Do you need uniqueness?
+  YES --> Set family
+    Need sorted? --> TreeSet
+    Need insertion order? --> LinkedHashSet
+    Need enum type? --> EnumSet
+    Otherwise --> HashSet
+  NO --> Continue
+
+Step 3: Do you need FIFO/priority processing?
+  YES --> Queue/Deque family
+    Need priority ordering? --> PriorityQueue
+    Need blocking? --> ArrayBlockingQueue / LinkedBlockingQueue
+    Need stack (LIFO)? --> ArrayDeque
+    Need double-ended? --> ArrayDeque
+  NO --> List family
+    Default choice --> ArrayList
+    Need thread-safe reads? --> CopyOnWriteArrayList
+```
+
+### Real-World Timing: How Fast Are Collections Actually?
+
+```
+Benchmark on modern hardware (JMH, Java 17, 1M elements):
+
+ArrayList.get(i):        ~3 ns     (direct array access)
+HashMap.get(key):        ~8 ns     (hash + equals)
+TreeMap.get(key):       ~40 ns     (tree traversal)
+LinkedList.get(i):     ~500 us     (traverse from end, 500,000 ns for middle)
+
+ArrayList.add(end):      ~5 ns     (amortized)
+HashMap.put(k,v):       ~12 ns     (hash + insert)
+TreeMap.put(k,v):       ~50 ns     (tree insert + rebalance)
+
+HashSet.contains(o):     ~8 ns     (same as HashMap.get)
+ArrayList.contains(o): ~2.5 ms     (linear scan of 1M elements)
+                                    312,500x SLOWER than HashSet!
+```
+
+**Critical Lesson:** The single most impactful optimization in Java code is replacing `list.contains()` with `set.contains()` inside a loop. This turns O(n^2) into O(n).
+
 ---
 
 # Chapter 10: Real-Time Enterprise Usage Scenarios
@@ -320,6 +371,32 @@ public class BatchExportService {
             ));
     }
 }
+```
+
+### Deep Theory: Thread Safety Decision for Collections
+
+```
+Scenario                          Best Collection Choice
+---------                         ---------------------
+Read-only after initialization    Collections.unmodifiableXxx() or List.of()
+Single writer, many readers       CopyOnWriteArrayList / CopyOnWriteArraySet
+Many writers, many readers (Map)  ConcurrentHashMap
+Bounded producer-consumer         ArrayBlockingQueue
+Unbounded producer-consumer       ConcurrentLinkedQueue
+Priority-based processing         PriorityBlockingQueue
+Sorted concurrent map             ConcurrentSkipListMap
+General purpose (single thread)   ArrayList, HashMap, HashSet
+```
+
+**Anti-Pattern: Double-Checked Locking on Collections**
+```java
+// WRONG: Race condition between check and put
+if (!map.containsKey(key)) {
+    map.put(key, computeValue(key));
+}
+
+// RIGHT: Atomic operation
+map.computeIfAbsent(key, k -> computeValue(k));
 ```
 
 ---
@@ -871,6 +948,28 @@ public abstract class AbstractList<E> extends AbstractCollection<E> {
     }
 }
 ```
+
+### Deep Theory: Design Patterns Summary Table
+
+| Pattern | JCF Implementation | Purpose |
+|---|---|---|
+| **Iterator** | `Iterator`, `ListIterator`, `Spliterator` | Traverse without exposing internals |
+| **Factory** | `List.of()`, `Collections.emptyList()` | Hide implementation classes |
+| **Strategy** | `Comparator` in `sort()`, `TreeSet`, `TreeMap` | Pluggable comparison algorithms |
+| **Adapter** | `Arrays.asList()`, `Map.keySet()` | Convert between interfaces |
+| **Decorator** | `unmodifiableList()`, `synchronizedList()` | Add behavior (read-only, thread-safe) |
+| **Template Method** | `AbstractList`, `AbstractMap` | Skeleton + customizable steps |
+| **Null Object** | `Collections.emptyList()`, `Collections.emptyMap()` | Safe empty returns instead of null |
+
+**Architect Insight:** The largest design lesson from JCF is "program to the interface". Every method signature should accept `List`, `Set`, `Map` -- never `ArrayList`, `HashSet`, `HashMap`. This allows swapping implementations without changing client code.
+
+### Interview Questions for Chapters 12-13
+
+**Q: What is the difference between stream().forEach() and collection.forEach()?**
+A: `collection.forEach()` iterates directly and may be slightly faster (no stream pipeline overhead). `stream().forEach()` creates a stream pipeline with potential lazy evaluation. `parallelStream().forEach()` order is non-deterministic. For side effects, use `collection.forEach()`. For transformation chains, use streams.
+
+**Q: Name three design patterns used in the Collections Framework and give examples.**
+A: 1) **Iterator** -- `list.iterator()` decouples traversal from data structure. 2) **Decorator** -- `Collections.unmodifiableList()` wraps a list to add read-only behavior. 3) **Strategy** -- `Comparator` passed to `TreeSet`, `Collections.sort()` for pluggable ordering.
 
 ---
 

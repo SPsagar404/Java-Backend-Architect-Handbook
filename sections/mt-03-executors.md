@@ -230,6 +230,110 @@ public class ExecutorConfig {
 | **Mixed** | `cores × (1 + wait_time/compute_time)` | Balance CPU usage |
 | **Web server** | `100-400` (Tomcat default: 200) | Most time waiting on DB/network |
 
+### Rejection Policies — What Happens When Pool and Queue Are Full
+
+```
+All 4 Built-in Rejection Policies:
+──────────────────────────────────
+
+1. AbortPolicy (DEFAULT)
+   → Throws RejectedExecutionException
+   → Use when: task loss is unacceptable, caller must know about failure
+   → Problem: can crash caller if not caught
+
+2. CallerRunsPolicy
+   → The submitting thread runs the task itself
+   → Use when: natural backpressure is desired
+   → Effect: slows down the caller, prevents task loss
+   → ⭐ RECOMMENDED for most production systems
+
+3. DiscardPolicy
+   → Silently drops the task
+   → Use when: task is expendable (metrics, analytics)
+   → Problem: silent data loss — hard to debug
+
+4. DiscardOldestPolicy
+   → Drops the oldest task in the queue, retries current task
+   → Use when: latest data matters most (real-time updates)
+   → Problem: may discard important long-waiting tasks
+```
+
+```java
+// Custom rejection handler for production (log + metrics)
+public class MonitoredRejectionPolicy implements RejectedExecutionHandler {
+    private final LongAdder rejectedCount = new LongAdder();
+    
+    @Override
+    public void rejectedExecution(Runnable r, ThreadPoolExecutor executor) {
+        rejectedCount.increment();
+        log.warn("Task rejected! Pool: {} active, Queue: {} pending",
+            executor.getActiveCount(), executor.getQueue().size());
+        
+        if (!executor.isShutdown()) {
+            // CallerRunsPolicy as fallback — natural backpressure
+            r.run();
+        }
+    }
+    
+    public long getRejectedCount() { return rejectedCount.sum(); }
+}
+```
+
+### Thread Pool Monitoring with Micrometer (Production Essential)
+
+```java
+@Configuration
+public class ThreadPoolMetrics {
+
+    @Bean
+    public MeterBinder threadPoolMetrics(@Qualifier("ioExecutor") ThreadPoolExecutor pool) {
+        return registry -> {
+            Gauge.builder("threadpool.active", pool, ThreadPoolExecutor::getActiveCount)
+                 .tag("pool", "io").register(registry);
+            Gauge.builder("threadpool.queue.size", pool, e -> e.getQueue().size())
+                 .tag("pool", "io").register(registry);
+            Gauge.builder("threadpool.pool.size", pool, ThreadPoolExecutor::getPoolSize)
+                 .tag("pool", "io").register(registry);
+            FunctionCounter.builder("threadpool.completed", pool,
+                 ThreadPoolExecutor::getCompletedTaskCount)
+                 .tag("pool", "io").register(registry);
+        };
+    }
+}
+
+// Key Alerts to Set:
+// ├─ queue.size > 80% of capacity → pool exhaustion approaching
+// ├─ active == maxPoolSize for > 1 min → pool fully loaded
+// ├─ rejected count increasing → pool is undersized or has a leak
+// └─ completed task rate dropping → possible deadlock or slow tasks
+```
+
+### Virtual Threads (Java 21+) and the Future of Executors
+
+```java
+// Traditional thread pool for IO:
+ExecutorService ioPool = Executors.newFixedThreadPool(200);  // 200 OS threads
+
+// Virtual thread executor (Java 21+):
+ExecutorService virtualPool = Executors.newVirtualThreadPerTaskExecutor();
+// Creates a NEW virtual thread for EACH task — millions possible
+// No need to size the pool — virtual threads are cheap (~KB each)
+
+// Spring Boot 3.2+ with virtual threads:
+// application.properties:
+//   spring.threads.virtual.enabled=true
+// All Tomcat threads + @Async threads become virtual threads automatically!
+```
+
+```
+When to switch to virtual threads:
+  ✓ IO-bound workloads (REST calls, DB queries, file IO)
+  ✓ High-concurrency servers (>1000 concurrent requests)
+  ✗ CPU-bound workloads (still need platform thread pools)
+  ✗ Code using synchronized heavily (virtual threads pin to carrier)
+     → Migrate synchronized → ReentrantLock before using virtual threads
+```
+
 ---
 
 # Chapter 10: CompletableFuture (Java 8+)
@@ -458,6 +562,63 @@ public class OrderAggregationService {
             });
     }
 }
+```
+
+### CompletableFuture Timeout Handling (Java 9+)
+
+```java
+// orTimeout — throws TimeoutException if not completed within duration
+CompletableFuture<ApiResponse> response = CompletableFuture
+    .supplyAsync(() -> callSlowApi(), ioExecutor)
+    .orTimeout(5, TimeUnit.SECONDS);  // Throws TimeoutException after 5s
+
+// completeOnTimeout — provides a default value on timeout
+CompletableFuture<ApiResponse> response = CompletableFuture
+    .supplyAsync(() -> callSlowApi(), ioExecutor)
+    .completeOnTimeout(ApiResponse.defaultValue(), 5, TimeUnit.SECONDS);
+
+// Production pattern: timeout + fallback + logging
+CompletableFuture<UserProfile> profile = CompletableFuture
+    .supplyAsync(() -> userService.getProfile(userId), ioExecutor)
+    .completeOnTimeout(UserProfile.anonymous(), 3, TimeUnit.SECONDS)
+    .whenComplete((result, ex) -> {
+        if (ex != null) {
+            log.warn("Profile fetch failed for user {}: {}", userId, ex.getMessage());
+            metrics.counter("profile.fetch.failure").increment();
+        }
+    });
+```
+
+### CompletableFuture Anti-Patterns
+
+```java
+// ❌ ANTI-PATTERN 1: Using join()/get() inside a CompletableFuture chain
+CompletableFuture.supplyAsync(() -> {
+    String result = otherFuture.join();  // BLOCKS the ForkJoinPool thread!
+    return process(result);
+});
+// FIX: Use thenCompose() to chain dependent futures
+
+// ❌ ANTI-PATTERN 2: Using common pool for IO-bound tasks
+CompletableFuture.supplyAsync(() -> dbQuery());  // Blocks FJP common pool!
+// FIX: Always pass custom executor for IO tasks
+CompletableFuture.supplyAsync(() -> dbQuery(), ioExecutor);
+
+// ❌ ANTI-PATTERN 3: Ignoring exceptions
+CompletableFuture.supplyAsync(() -> riskyOperation())
+    .thenApply(r -> transform(r));  // Exception is silently swallowed!
+// FIX: Always add exception handling
+    .exceptionally(ex -> {
+        log.error("Operation failed", ex);
+        return fallbackValue();
+    });
+
+// ❌ ANTI-PATTERN 4: Not understanding *Async variants
+thenApply(fn)       // Runs fn on SAME thread that completed the previous stage
+thenApplyAsync(fn)  // Runs fn on ForkJoinPool.commonPool()
+thenApplyAsync(fn, executor)  // Runs fn on custom executor ← PREFER THIS
+// In production, always use the *Async variant with a custom executor
+// to avoid unpredictable thread behavior
 ```
 
 ---
@@ -747,5 +908,137 @@ customPool.shutdown();
 | Shared mutable state | **No** | Race conditions |
 | ArrayList source | **Yes** | Good spliterator (random access) |
 | LinkedList source | **No** | Poor spliterator (sequential access) |
+
+### The N×Q Model for Parallel Stream Decisions
+
+Doug Lea (creator of `java.util.concurrent`) proposed the **N×Q > 10,000** rule:
+
+```
+N = number of elements
+Q = cost of each operation (in CPU cycles)
+
+Use parallel stream ONLY when N × Q > 10,000
+
+Examples:
+  10 elements × filter (Q=10)     = 100        → SEQUENTIAL
+  1,000 elements × sort (Q=100)   = 100,000    → PARALLEL ✓
+  100,000 elements × map (Q=5)    = 500,000    → PARALLEL ✓
+  50 elements × ML inference (Q=10,000) = 500K  → PARALLEL ✓
+
+How to estimate Q:
+  • Simple filter/map: Q ≈ 1-10
+  • String operations: Q ≈ 10-100
+  • Parsing/serialization: Q ≈ 100-1,000
+  • Complex computations: Q ≈ 1,000-100,000
+```
+
+### Source Data Structure Spliterator Quality
+
+```
+Data Source Spliterator Quality (affects parallel stream performance):
+─────────────────────────────────────────────────────────────────────
+
+Excellent spliterators (split evenly, random access):
+  • ArrayList, arrays → split in O(1) at midpoint
+  • IntStream.range()  → split in O(1)
+  • TreeMap, HashSet   → reasonable splitting
+
+Poor spliterators (sequential access only):
+  • LinkedList         → must traverse to find midpoint O(n)
+  • Stream.iterate()   → cannot split at all (processes sequentially)
+  • BufferedReader.lines() → poor splitting
+  • Custom Iterators   → depends on implementation
+
+If you have a custom data source:
+  Implement your own Spliterator for optimal parallel performance.
+```
+
+```java
+// Custom Spliterator example for a time-series database
+public class TimeSeriesSpliterator implements Spliterator<DataPoint> {
+    private final DataPoint[] data;
+    private int current;
+    private int end;
+    
+    @Override
+    public Spliterator<DataPoint> trySplit() {
+        int mid = (current + end) >>> 1;  // Split in half
+        if (mid == current) return null;  // Too small to split
+        TimeSeriesSpliterator prefix = new TimeSeriesSpliterator(data, current, mid);
+        current = mid;
+        return prefix;
+    }
+    
+    @Override
+    public long estimateSize() { return end - current; }
+    
+    @Override
+    public int characteristics() {
+        return SIZED | SUBSIZED | ORDERED | NONNULL | IMMUTABLE;
+    }
+    
+    @Override
+    public boolean tryAdvance(Consumer<? super DataPoint> action) {
+        if (current < end) {
+            action.accept(data[current++]);
+            return true;
+        }
+        return false;
+    }
+}
+
+// Usage: create a parallel stream from custom spliterator
+Stream<DataPoint> parallelTimeSeries = StreamSupport.stream(
+    new TimeSeriesSpliterator(data, 0, data.length), true  // true = parallel
+);
+```
+
+### Fork/Join: Threshold Selection Guidelines
+
+Choosing the right threshold (when to stop splitting and process sequentially) is critical for Fork/Join performance:
+
+```
+Threshold Selection Rules of Thumb:
+───────────────────────────────────
+
+1. Start with: threshold = N / (parallelism × 4)
+   where N = total elements, parallelism = available cores
+   Example: 1,000,000 elements on 8 cores → threshold ≈ 31,250
+
+2. Benchmark with different thresholds:
+   Too high:  not enough parallelism (few tasks, some cores idle)
+   Too low:   too many tasks (overhead of forking exceeds computation)
+   Sweet spot: tasks take 100μs to 10ms each
+
+3. Consider the cost of your computation:
+   Cheap operations (sum, filter): threshold = 10,000 - 100,000
+   Expensive operations (crypto, ML): threshold = 10 - 100
+
+4. ManagedBlocker for blocking inside ForkJoinPool:
+   If your task MUST block (e.g., waiting for IO), use ManagedBlocker
+   to tell the pool to create a compensation thread.
+```
+
+```java
+// ManagedBlocker: safely block inside ForkJoinPool
+ForkJoinPool.managedBlock(new ForkJoinPool.ManagedBlocker() {
+    private boolean done = false;
+    
+    @Override
+    public boolean block() throws InterruptedException {
+        // This blocks — but ForkJoinPool knows and can compensate
+        result = blockingApiCall();
+        done = true;
+        return true;
+    }
+    
+    @Override
+    public boolean isReleasable() {
+        return done;
+    }
+});
+// ForkJoinPool creates a temporary compensation thread so other
+// tasks don't starve while this task blocks.
+```
 
 ---

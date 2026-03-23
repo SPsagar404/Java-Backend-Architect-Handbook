@@ -269,6 +269,80 @@ Clear ThreadLocal variables after use. Weak references in caches (WeakHashMap). 
 
 ---
 
+## SCENARIO-BASED (Q66–Q80)
+
+**Q66. A production Spring Boot app becomes unresponsive under load, but CPU usage is only 5%. What's your debugging approach?**
+Low CPU + unresponsive = threads waiting on something (locks, IO, connections). Steps: 1) Take 3 thread dumps 10s apart. 2) Count BLOCKED and WAITING threads. 3) If many BLOCKED → lock contention (find the lock). 4) If many WAITING on connection pool → pool exhaustion (increase pool or add timeouts). 5) Check HikariCP metrics for connection leaks.
+
+**Q67. Your team wants to use parallelStream() for batch database inserts. What's your advice?**
+DON'T do it. parallelStream() uses ForkJoinPool.commonPool() which is shared across the entire JVM. Blocking DB calls will starve ALL other parallel streams. Instead, use a dedicated ExecutorService with CompletableFuture, or batch the inserts into chunks and use JDBC batch operations.
+
+**Q68. You have a microservice making 5 REST calls to downstream services. Currently sequential (2.5s total). How to optimize?**
+Use CompletableFuture with a custom IO executor: `CompletableFuture.allOf(call1, call2, call3, call4, call5)` runs all in parallel. Total time ≈ max of individual calls (~500ms instead of 2.5s). Always use `completeOnTimeout()` for each call. If one fails, use `exceptionally()` with fallback.
+
+**Q69. What would happen if you used `Executors.newCachedThreadPool()` in a HTTP API handler?**
+Under load spike, each request creates a new thread (since cached threads are reused only if idle ≤60s). A burst of 50,000 requests → 50,000 threads → ~50GB memory → OutOfMemoryError. Always use `newFixedThreadPool()` or `ThreadPoolExecutor` with bounded queue.
+
+**Q70. You observe intermittent NullPointerException in production, but the code looks correct in single-threaded analysis. What could cause this?**
+Race condition on a shared reference: Thread A reads the object, Thread B sets it to null between read and use. Or: instruction reordering — an object reference published before the constructor finishes (broken double-checked locking without volatile). Fix: make the reference volatile, use AtomicReference, or use proper synchronization.
+
+**Q71. A thread dump shows 150 threads in BLOCKED state all waiting on `OrderService.processOrder()`. What's happening?**
+The `processOrder()` method is likely synchronized on a single lock (or uses a synchronized method), creating a bottleneck. Solutions: 1) Reduce synchronized scope. 2) Use ConcurrentHashMap instead of synchronized HashMap. 3) Use read-write lock if mostly reads. 4) Consider lock-free alternatives.
+
+**Q72. Your application has 200 Tomcat threads and a HikariCP pool of 10. What happens when all 200 threads need DB access?**
+190 threads will wait for a connection (only 10 available). If `connectionTimeout` is not set, they wait forever → request timeouts cascade. Fix: 1) Size connection pool appropriately (but more connections = more DB load). 2) Set `connection-timeout=5000` to fail fast. 3) Use `leak-detection-threshold` to catch leaks.
+
+**Q73. When should you use virtual threads vs reactive programming vs traditional thread pools?**
+Virtual threads (Java 21+): Simple blocking IO code, need to handle many concurrent requests, team prefers imperative style. Reactive (WebFlux): Need full backpressure, streaming data pipelines, already have reactive team. Traditional pools: CPU-bound work, legacy systems, need fine-grained control over concurrency.
+
+**Q74. A CountDownLatch with count 5 hangs forever in production. What happened?**
+One of the 5 tasks threw an uncaught exception before calling `countDown()`. The latch stays at count > 0 forever. Fix: Always call `countDown()` in a finally block, OR use `latch.await(30, TimeUnit.SECONDS)` with a timeout.
+
+**Q75. You need to implement a cache that refreshes every 5 minutes. How to make it thread-safe?**
+Use `AtomicReference<CacheData>` with a scheduled task. The scheduler calls `cacheRef.set(loadFreshData())` atomically. All readers call `cacheRef.get()` (lock-free). Alternatively, use `ConcurrentHashMap.computeIfAbsent()` with TTL-based expiry, or use Caffeine cache (`LoadingCache`).
+
+**Q76. What happens if you use `synchronized` keyword inside virtual threads?**
+Virtual threads PIN to the carrier (platform) thread when inside synchronized blocks. The carrier cannot be reused until the synchronized block completes. Under load, this can exhaust all carrier threads. Fix: Replace synchronized with ReentrantLock, which virtual threads can unmount from.
+
+**Q77. How would you design a thread-safe audit log system that doesn't slow down the main request?**
+Use a producer-consumer pattern: Main thread submits audit events to a `LinkedBlockingQueue` (non-blocking `offer()`). Background consumers `take()` from queue and batch-insert to DB every 5 seconds. Use `ConcurrentLinkedQueue` if you can't afford any blocking on the producer side.
+
+**Q78. Your thread pool monitoring shows queue size keeps growing but completed task count is stable. What's wrong?**
+Producers are faster than consumers. Either: 1) Tasks are slow (check for blocking calls or resource contention). 2) Pool is undersized for the workload. 3) Tasks are deadlocking. Take a thread dump to see what worker threads are doing. Increase pool size or optimize task execution.
+
+**Q79. How do you test that a class is thread-safe in unit tests?**
+```java
+@RepeatedTest(10)  // Run 10 times to catch intermittent failures
+void testConcurrentAccess() throws InterruptedException {
+    ThreadSafeList<String> list = new ThreadSafeList<>();
+    int threads = 100;
+    CountDownLatch ready = new CountDownLatch(threads);
+    CountDownLatch go = new CountDownLatch(1);
+    CountDownLatch done = new CountDownLatch(threads);
+
+    for (int i = 0; i < threads; i++) {
+        final int idx = i;
+        new Thread(() -> {
+            ready.countDown();
+            try { go.await(); } catch (InterruptedException e) {}
+            list.add("item-" + idx);
+            done.countDown();
+        }).start();
+    }
+
+    ready.await();  // All threads ready
+    go.countDown(); // Release all at once
+    done.await();   // Wait for all to finish
+
+    assertEquals(threads, list.size());  // Must always be 100
+}
+```
+
+**Q80. You're reviewing a PR that uses `Collections.synchronizedMap(new HashMap<>())`. What feedback would you give?**
+1) Replace with `ConcurrentHashMap` for better performance (per-bin locking vs whole-map locking). 2) Even with synchronizedMap, compound operations like `if(!map.containsKey(k)) map.put(k,v)` are NOT atomic — still needs external synchronization or `computeIfAbsent()`. 3) Iteration requires manual synchronization with synchronizedMap but not with ConcurrentHashMap.
+
+---
+
 # Chapter 19: Coding Problems (20 Exercises)
 
 ## Exercise 1: Producer-Consumer with BlockingQueue
@@ -963,4 +1037,68 @@ public MeterBinder threadPoolMetrics(ThreadPoolExecutor pool) {
 
 **Document Version:** 1.0  
 **Last Updated:** March 2026  
-**Topics Covered:** 20 Chapters, 65+ Interview Questions, 20 Coding Exercises  
+**Topics Covered:** 20 Chapters, 80+ Interview Questions, 20 Coding Exercises  
+
+## Senior Engineer Decision Framework
+
+### Concurrency Approach Selection
+
+```
+Step 1: Do you actually NEED multithreading?
+  ├─ Is the current approach fast enough? → Don't add complexity
+  ├─ Is the bottleneck IO or CPU?
+  │   ├─ IO: Can you batch requests? Use async IO? Increase pool size?
+  │   └─ CPU: Can you optimize the algorithm first?
+  └─ Is the data truly shared? Can you partition it?
+
+Step 2: Choose the right concurrency model
+  ├─ Simple background task → @Async or CompletableFuture.runAsync()
+  ├─ Parallel independent calls → CompletableFuture.allOf()
+  ├─ Producer-consumer pipeline → BlockingQueue + dedicated consumers
+  ├─ CPU-bound batch processing → parallel streams or ForkJoinPool
+  ├─ High-concurrency IO (10K+) → Virtual threads (Java 21) or WebFlux
+  └─ Real-time streaming → Kafka/RxJava/Project Reactor
+
+Step 3: Choose the right synchronization
+  ├─ Can data be immutable? → No synchronization needed (BEST)
+  ├─ Can data be thread-local? → ThreadLocal or ScopedValue
+  ├─ Simple counter? → AtomicInteger or LongAdder
+  ├─ Key-value access? → ConcurrentHashMap (always)
+  ├─ Read-heavy shared state? → StampedLock or ReadWriteLock
+  └─ Complex multi-field update? → synchronized or ReentrantLock
+```
+
+### Production Readiness Checklist for Concurrent Systems
+
+```
+Before deploying a multithreaded system to production:
+────────────────────────────────────────────────────
+
+Thread Pool Configuration:
+  ☐ All pools use bounded queues
+  ☐ Pool sizes are based on workload type (CPU vs IO)
+  ☐ Rejection policies are set (CallerRunsPolicy recommended)
+  ☐ Threads are named (for debugging)
+  ☐ Graceful shutdown is implemented (@PreDestroy)
+
+Safety:
+  ☐ No raw Thread creation (use ExecutorService)
+  ☐ ThreadLocal values are removed after use
+  ☐ InterruptedException is handled properly
+  ☐ No synchronized blocks around IO/network calls
+  ☐ Lock ordering is consistent where nested locks exist
+
+Monitoring:
+  ☐ Thread pool metrics are exposed (active, queue size, rejected)
+  ☐ Connection pool metrics are monitored
+  ☐ Alerting is set for pool exhaustion
+  ☐ Thread dump automation is in place for incidents
+
+Testing:
+  ☐ Concurrent unit tests with CountDownLatch/CyclicBarrier
+  ☐ Load tests with realistic concurrency levels
+  ☐ Stress tests to verify rejection and graceful degradation
+  ☐ Thread dump analysis performed under load
+```
+
+---

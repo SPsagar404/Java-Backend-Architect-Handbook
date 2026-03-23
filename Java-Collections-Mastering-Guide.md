@@ -125,6 +125,48 @@ public class OrderProcessor {
 ### How
 The JCF is built around a core set of interfaces that form a hierarchy. Concrete classes implement these interfaces, and the `Collections` utility class provides algorithms. You choose the right implementation based on your requirements for ordering, uniqueness, thread safety, and performance.
 
+### Deep Theory: How Senior Engineers Think About Data Structure Selection
+
+When a senior engineer picks a collection, they ask four questions in order:
+
+```
+1. SHAPE: Do I need key-value pairs (Map) or just elements (Collection)?
+2. CONSTRAINT: Do I need uniqueness (Set), ordering (List), or processing order (Queue)?
+3. ORDERING: Do I need sorted order (TreeMap/TreeSet), insertion order (LinkedHashMap), or none (HashMap)?
+4. CONCURRENCY: Will multiple threads access this? (ConcurrentHashMap, CopyOnWriteArrayList)
+```
+
+**The 80/20 Rule in Production:** In 80% of enterprise code, you only use these four:
+- `ArrayList` -- for ordered data and API responses
+- `HashMap` -- for key-value lookups and caching
+- `HashSet` -- for deduplication and membership tests
+- `ConcurrentHashMap` -- for thread-safe caching
+
+The remaining 20% of cases require specialized choices (TreeMap for sorted ranges, LinkedHashMap for LRU caches, PriorityQueue for scheduling).
+
+### Memory Model: How Collections Consume Memory
+
+```
+Object Overhead in Java (64-bit JVM with compressed oops):
+- Object header: 12 bytes (mark word + class pointer)
+- Alignment padding: to 8-byte boundary
+- Reference: 4 bytes (compressed) or 8 bytes
+
+Collection Memory Per Element:
+- ArrayList: ~4 bytes (object reference in array)
+- LinkedList: ~48 bytes (Node object: 16 header + 4 item ref + 4 next + 4 prev + padding)
+- HashMap: ~48-80 bytes (Node: 16 header + 4 hash + 4 key + 4 value + 4 next + padding)
+- HashSet: same as HashMap (uses HashMap internally)
+- TreeMap: ~64 bytes (TreeNode with parent/left/right/color)
+
+For 1 million elements:
+- ArrayList: ~4 MB + array overhead
+- LinkedList: ~48 MB (12x more!)
+- HashMap: ~48-80 MB per million entries
+```
+
+**Production Lesson:** A developer once used `LinkedList` for a 5-million-record dataset. Memory usage was 240MB instead of 20MB with `ArrayList`. The app ran out of heap space in production during peak load.
+
 ---
 
 ## 1.2 Why Was the Collections Framework Introduced?
@@ -257,6 +299,8 @@ List<String> syncList = Collections.synchronizedList(new ArrayList<>());
 **5. Fail-Fast Iterators:**
 Iterators detect concurrent modification and throw `ConcurrentModificationException` rather than producing unpredictable results.
 
+**Deep Theory: fail-fast is "best-effort", not guaranteed.** The `modCount` mechanism does not use synchronization, so under true concurrent access from multiple threads, the CME may not be thrown -- you might get corrupted data silently instead. This is why `ConcurrentHashMap`/`CopyOnWriteArrayList` exist for multi-threaded scenarios.
+
 ---
 
 ## 1.4 The java.util.Collections Utility Class
@@ -320,6 +364,42 @@ public class AppConfig {
 }
 ```
 
+### Common Gotchas with Collections Utility
+
+```java
+// GOTCHA 1: Collections.unmodifiableList() is a VIEW, not a copy
+List<String> original = new ArrayList<>(Arrays.asList("A", "B"));
+List<String> readOnly = Collections.unmodifiableList(original);
+original.add("C"); // Modifies the original
+System.out.println(readOnly); // [A, B, C] -- view reflects change!
+// FIX: List.copyOf(original) creates a true immutable copy (Java 10+)
+
+// GOTCHA 2: Collections.synchronizedList() doesn't protect iteration
+List<String> syncList = Collections.synchronizedList(new ArrayList<>());
+// WRONG: iteration is NOT synchronized
+for (String s : syncList) { ... } // ConcurrentModificationException risk!
+// FIX: wrap iteration in synchronized block
+synchronized (syncList) {
+    for (String s : syncList) { ... }
+}
+
+// GOTCHA 3: Collections.emptyList() returns immutable singleton
+List<String> empty = Collections.emptyList();
+empty.add("A"); // UnsupportedOperationException!
+// Use new ArrayList<>() if you need to add elements later
+```
+
+### Production Debugging: Collection-Related Issues
+
+| Symptom | Likely Cause | Diagnosis |
+|---|---|---|
+| `ConcurrentModificationException` | Modifying collection during iteration | Check for `list.remove()` inside for-each loop |
+| `OutOfMemoryError` | Wrong collection choice for large data | Profile with VisualVM, check LinkedList vs ArrayList |
+| `NullPointerException` on Map.get() | Assuming non-null return | Use `getOrDefault()` or `Optional.ofNullable()` |
+| `StackOverflowError` | Circular references in `equals()`/`hashCode()` | Check bidirectional entity relationships |
+| Lost HashMap entries | Mutable key modified after insertion | Use immutable keys only (String, Integer, records) |
+| Slow API responses | `contains()` on ArrayList in loop (O(n^2)) | Switch to HashSet for O(1) lookup |
+
 ---
 
 ## 1.5 Arrays vs Collections - Detailed Comparison
@@ -372,6 +452,17 @@ list.stream()
     .sorted(Comparator.comparing(Order::getDate))
     .collect(Collectors.toList());
 ```
+
+### Interview Questions for Chapter 1
+
+**Q: How does ArrayList grow internally and what is the growth factor?**
+A: ArrayList grows by 50% -- `newCapacity = oldCapacity + (oldCapacity >> 1)`. It uses `Arrays.copyOf()` which calls the native `System.arraycopy()` to copy elements to the new, larger array. The first `add()` on a default-constructed ArrayList allocates an array of size 10.
+
+**Q: When would you choose an array over a collection in production code?**
+A: For performance-critical numeric processing (avoids boxing overhead), fixed-size data known at compile time, multi-dimensional data (matrices), and interop with native JNI or legacy APIs. In all other cases, collections provide a richer API.
+
+**Q: What is the memory overhead difference between ArrayList and LinkedList?**
+A: ArrayList uses ~4 bytes per element (object reference). LinkedList uses ~48 bytes per element (Node object with header, item, prev, next). For 1 million objects, that's ~4MB vs ~48MB -- a 12x difference. Always prefer ArrayList unless you specifically need O(1) insertions at both ends.
 
 ---
 
@@ -452,6 +543,27 @@ while (it.hasNext()) {
 }
 ```
 
+### Deep Theory: Spliterator and Parallel Processing
+
+Java 8 added `spliterator()` to enable parallel streams. A Spliterator can split a collection into chunks for concurrent processing:
+
+```java
+// How parallelStream() works internally:
+// 1. collection.spliterator() creates the root Spliterator
+// 2. ForkJoinPool calls trySplit() to divide data
+// 3. Each partition is processed by a separate thread
+// 4. Results are combined
+
+// Custom Spliterator characteristics affect performance:
+// ORDERED -- elements have a defined encounter order (List)
+// DISTINCT -- no two elements are equal (Set)
+// SORTED -- elements are in sorted order (TreeSet)
+// SIZED -- exact size is known (ArrayList)
+// NONNULL -- source guarantees no nulls
+```
+
+**Production Tip:** `ArrayList.spliterator()` supports efficient splitting (divides array in half). `LinkedList.spliterator()` splits poorly (must traverse to find midpoint). This is why parallel streams on `ArrayList` are 2-5x faster than on `LinkedList`.
+
 ---
 
 ## 2.2 Collection\<E\> Interface
@@ -509,6 +621,26 @@ public class NotificationService {
     }
 }
 ```
+
+### Deep Theory: The UnsupportedOperationException Contract
+
+The Collection interface includes methods like `add()`, `remove()`, `clear()`, but NOT all implementations support them. Immutable collections throw `UnsupportedOperationException`:
+
+```java
+List<String> immutable = List.of("A", "B", "C");
+immutable.add("D"); // UnsupportedOperationException!
+
+// This is the "optional operation" pattern in JCF
+// The interface declares the method, but Javadoc marks it as optional
+// Implementation decides whether to support it
+```
+
+**Why this design?** To avoid an explosion of sub-interfaces (ReadableCollection, WritableCollection, etc.). This is a trade-off: compile-time type safety is sacrificed for interface simplicity.
+
+### Interview Question for Chapter 2
+
+**Q: Why does Map not extend Collection?**
+A: Because Map stores key-value pairs, not individual elements. The `add(E e)` method of Collection doesn't make sense for maps (what would you add -- a key? a value? both?). Maps have their own hierarchy with `put(K, V)`, `get(K)`, `entrySet()`, etc.
 
 ---
 
@@ -579,6 +711,24 @@ List<String> copy = List.copyOf(existingList);
 List<String> unmodifiable = List.copyOf(mutableList);
 ```
 
+### Deep Theory: The subList() Trap
+
+`subList()` returns a VIEW of the original list, not a copy. This is both powerful and dangerous:
+
+```java
+List<String> original = new ArrayList<>(List.of("A", "B", "C", "D", "E"));
+List<String> sub = original.subList(1, 4); // [B, C, D] -- VIEW, not copy
+
+sub.set(0, "X"); // original is now [A, X, C, D, E]
+original.add("F"); // DANGER: structurally modifying original
+sub.get(0); // ConcurrentModificationException! subList is invalidated
+
+// SAFE pattern: copy the subList if you need independence
+List<String> safeSub = new ArrayList<>(original.subList(1, 4));
+```
+
+**Production Scenario:** A developer returned `list.subList(0, 10)` from a service method. The caller stored it. Later, the original list was cleared. The subList now threw CME on every access, causing intermittent 500 errors.
+
 ---
 
 ## 2.4 Set\<E\> Interface
@@ -648,6 +798,40 @@ public class DataImportService {
 ### Sub-interfaces
 - **SortedSet\<E\>**: Elements maintained in sorted order. Provides `first()`, `last()`, `headSet()`, `tailSet()`, `subSet()`.
 - **NavigableSet\<E\>** (Java 6+): Extends SortedSet with navigation methods: `lower()`, `floor()`, `ceiling()`, `higher()`, `pollFirst()`, `pollLast()`.
+
+### Deep Theory: Set Algebra in Production
+
+Sets support mathematical set operations that are tremendously useful:
+
+```java
+// UNION: combine two sets
+Set<String> union = new HashSet<>(setA);
+union.addAll(setB);
+
+// INTERSECTION: common elements
+Set<String> intersection = new HashSet<>(setA);
+intersection.retainAll(setB);
+
+// DIFFERENCE: elements in A but not in B
+Set<String> difference = new HashSet<>(setA);
+difference.removeAll(setB);
+
+// SYMMETRIC DIFFERENCE: elements in A or B but not both
+Set<String> symDiff = new HashSet<>(setA);
+symDiff.addAll(setB);
+Set<String> common = new HashSet<>(setA);
+common.retainAll(setB);
+symDiff.removeAll(common);
+```
+
+**Real-World Use Case:** In a permissions system, you compute which permissions were added/removed when a role changes:
+```java
+Set<String> oldPerms = getPermissions(role, oldVersion);
+Set<String> newPerms = getPermissions(role, newVersion);
+Set<String> added = new HashSet<>(newPerms);   added.removeAll(oldPerms);
+Set<String> removed = new HashSet<>(oldPerms); removed.removeAll(newPerms);
+auditLog.record(role, added, removed);
+```
 
 ---
 
@@ -750,6 +934,30 @@ offer(e)   // equivalent to offerLast(e)
 poll()     // equivalent to pollFirst()
 peek()     // equivalent to peekFirst()
 ```
+
+### Deep Theory: Why ArrayDeque is Faster Than LinkedList
+
+```
+Benchmark Results (JMH, 1M operations):
+  ArrayDeque.offer():   ~12 ns/op
+  LinkedList.offer():   ~35 ns/op  (3x slower)
+  
+  ArrayDeque.poll():    ~8 ns/op
+  LinkedList.poll():    ~25 ns/op  (3x slower)
+
+Reasons:
+1. CPU Cache Locality: ArrayDeque stores elements in contiguous array
+   -> CPU prefetcher loads adjacent elements into L1 cache
+   LinkedList nodes are scattered across heap -> cache misses
+
+2. Memory Overhead: ArrayDeque has zero per-element overhead
+   LinkedList creates a Node object (48 bytes) per element
+
+3. GC Pressure: ArrayDeque creates no garbage on poll()
+   LinkedList creates garbage Node objects for GC to collect
+```
+
+**Rule:** Always use `ArrayDeque` instead of `LinkedList` for Stack/Queue behavior. The only exception is when you need null elements (ArrayDeque forbids nulls).
 
 ### Enterprise Usage
 ```java
@@ -874,6 +1082,41 @@ Map<String, Integer> copy = Map.copyOf(existingMap);
 - **NavigableMap\<K,V\>**: Extended SortedMap with navigation methods
 - **ConcurrentMap\<K,V\>**: Thread-safe map with atomic operations
 
+### Deep Theory: Java 8 Map Methods Cheat Sheet
+
+| Method | When to Use | Example |
+|---|---|---|
+| `getOrDefault(k, def)` | Avoid null checks | `map.getOrDefault("key", "N/A")` |
+| `putIfAbsent(k, v)` | Insert only if missing | `cache.putIfAbsent(id, loadFromDB())` |
+| `computeIfAbsent(k, fn)` | Lazy compute on miss | `map.computeIfAbsent(key, k -> new ArrayList<>())` |
+| `computeIfPresent(k, fn)` | Update only if exists | `map.computeIfPresent(key, (k,v) -> v + 1)` |
+| `compute(k, fn)` | Insert or update | `map.compute(key, (k,v) -> v == null ? 1 : v + 1)` |
+| `merge(k, v, fn)` | Elegant frequency counting | `map.merge(word, 1, Integer::sum)` |
+| `replaceAll(fn)` | Transform all values | `map.replaceAll((k,v) -> v.toUpperCase())` |
+
+**Production Pattern -- Multi-Value Map:**
+```java
+// Building a Map<String, List<String>> safely
+Map<String, List<String>> multiMap = new HashMap<>();
+multiMap.computeIfAbsent("category", k -> new ArrayList<>()).add("item1");
+multiMap.computeIfAbsent("category", k -> new ArrayList<>()).add("item2");
+// Result: {category=[item1, item2]}
+
+// WRONG approach (NPE if key doesn't exist):
+multiMap.get("category").add("item1"); // NullPointerException!
+```
+
+### Interview Questions for Chapter 2
+
+**Q: What is the difference between offer() and add() in Queue?**
+A: Both insert elements, but `add()` throws `IllegalStateException` if the queue is full (bounded queues), while `offer()` returns `false`. In unbounded queues (LinkedList, ArrayDeque), both behave identically.
+
+**Q: Why does Java recommend Deque over Stack?**
+A: Stack extends Vector (synchronized overhead, bad IS-A relationship). Stack also inherits `add(index, e)` which breaks LIFO semantics. ArrayDeque is faster, not synchronized, and enforces Deque contract properly.
+
+**Q: Why does Map not extend Collection?**
+A: Map stores key-value pairs, not individual elements. Collection's `add(E)` method doesn't fit maps. Map has its own API: `put(K,V)`, `get(K)`, `entrySet()`. However, you can get Collection views: `map.keySet()`, `map.values()`, `map.entrySet()`.
+
 ---
 
 
@@ -970,6 +1213,29 @@ list.remove(2);
 | `indexOf(o)` | O(n) | Linear search |
 | `size()` | O(1) | Returns field value |
 | `isEmpty()` | O(1) | Checks size == 0 |
+
+### Deep Theory: ArrayList Resize Cost Analysis
+
+```
+Growth Pattern (starting from default capacity 10):
+Capacity:  10 -> 15 -> 22 -> 33 -> 49 -> 73 -> 109 -> 163 -> 244 -> ...
+
+To store 1,000,000 elements:
+- Number of resizes: ~44 times
+- Total elements copied across all resizes: ~2,000,000 (2x total elements)
+- Amortized cost per add(): O(1) -- despite O(n) individual resizes
+
+Pre-sizing avoidance:
+new ArrayList<>(1_000_000)  -- ZERO resizes, ZERO copies
+new ArrayList<>()          -- 44 resizes, 2M copies
+```
+
+**Production Rule:** Always pre-size ArrayList when you know or can estimate the size:
+```java
+// Converting database results -- you know the size!
+List<DTO> dtos = new ArrayList<>(entities.size()); // Pre-sized
+for (Entity e : entities) { dtos.add(toDTO(e)); }
+```
 
 ### Thread Safety
 **ArrayList is NOT thread-safe.** For concurrent access:
@@ -1106,7 +1372,30 @@ list.get(5);
 ### When NOT to Use LinkedList
 - Random access patterns (use ArrayList instead)
 - Memory-constrained environments (each element has ~40 bytes overhead for Node object)
-- Cache performance matters (non-contiguous memory layout -> poor CPU cache utilization)
+- Cache performance matters (non-contiguous memory layout -- poor CPU cache utilization)
+
+### Deep Theory: The CPU Cache Problem with LinkedList
+
+```
+ArrayList in Memory:    [A][B][C][D][E][F][G][H]  -- contiguous
+  CPU cache line (64 bytes) loads multiple elements at once
+  Access pattern: predictable, sequential -- CPU prefetcher loves this
+
+LinkedList in Memory:   [A]-->[somewhere in heap][B]-->[elsewhere][C]...
+  Each Node is a separate heap allocation
+  Access pattern: random jumps -- CPU prefetcher cannot predict
+  Result: cache miss on almost every node access
+```
+
+**Benchmark Reality:** Even for operations where LinkedList has O(1) complexity (like insertion at a known iterator position), ArrayList is often faster in practice due to CPU cache effects -- up to 10x faster for sequential access patterns.
+
+### Interview Questions for List Implementations
+
+**Q: A developer says "I use LinkedList because insertion is O(1)". Is that correct?**
+A: Partially. Insertion at a KNOWN position (via iterator) is O(1). But finding that position is O(n). In practice, most insertions require finding the position first, making it O(n). ArrayList's O(n) shift operation uses `System.arraycopy()` (native memcpy), which is extremely fast due to cache locality.
+
+**Q: When would you actually use LinkedList in production?**
+A: Almost never as a List. The only valid use is as a `Deque` (double-ended queue) when you need both `addFirst()` and `addLast()` O(1). But even then, `ArrayDeque` is faster. LinkedList's real niche: when you need to remove elements during iteration using `Iterator.remove()` without shifting.
 
 ---
 
@@ -1229,6 +1518,24 @@ public class EventPublisher {
 | `contains(o)` | O(n) - Linear scan |
 | Iteration | O(n) - Snapshot, no ConcurrentModificationException |
 
+### Deep Theory: Why CopyOnWriteArrayList Iterators Never Throw CME
+
+```
+Thread A (reading):              Thread B (writing):
+iterator = list.iterator()       list.add("X")
+  |-- snapshot = array@v1          |-- creates new array@v2
+  |-- iterating over array@v1      |-- array@v2 = copy + "X"
+  |-- sees: [A, B, C]             |-- list.array = array@v2
+  |-- NEVER sees "X"              
+  |-- NO CME thrown               
+
+Key: iterator holds reference to OLD array snapshot
+New writes create entirely new arrays
+Old array is eventually GC'd when iterator finishes
+```
+
+**Warning:** CopyOnWriteArrayList is TERRIBLE for write-heavy workloads. Adding 1000 elements to a list of 10,000 creates 1000 array copies of ~10,000 elements each = 10 million element copies!
+
 ---
 
 # Chapter 4: Set Implementations Deep Dive
@@ -1306,6 +1613,26 @@ public class Employee {
 | `remove(o)` | O(1) | O(n) |
 | `contains(o)` | O(1) | O(n) |
 | Iteration | O(n + capacity) | O(n + capacity) |
+
+### Deep Theory: Why HashSet Uniqueness Can Silently Break
+
+```java
+// DANGEROUS: Mutable object in HashSet
+List<String> list1 = new ArrayList<>(Arrays.asList("A"));
+Set<List<String>> set = new HashSet<>();
+set.add(list1);
+
+System.out.println(set.contains(list1)); // true
+
+list1.add("B"); // Mutating the element AFTER adding to set!
+
+System.out.println(set.contains(list1)); // FALSE! hashCode changed!
+// The element is STILL in the set, but in the wrong bucket
+// It's a phantom entry -- you can't find it, can't remove it
+// It stays in memory until the set is garbage collected
+```
+
+**Production Rule:** Objects stored in HashSet (or used as HashMap keys) must be effectively immutable. Use `String`, `Integer`, `Long`, `enum`, or immutable records.
 
 ---
 
@@ -1390,6 +1717,32 @@ public class TreeSet<E> extends AbstractSet<E>
 | `first()` / `last()` | O(log n) |
 | `lower()` / `higher()` | O(log n) |
 | `floor()` / `ceiling()` | O(log n) |
+
+### Deep Theory: Comparable vs Comparator Trap in TreeSet
+
+```java
+// TRAP: TreeSet uses compareTo() for EQUALITY, not equals()
+TreeSet<String> set = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+set.add("Hello");
+set.add("hello"); // NOT added! compareTo returns 0 ("equal" by comparator)
+System.out.println(set.size()); // 1!
+
+// This means TreeSet's behavior depends on the Comparator
+// Two objects are "equal" in TreeSet if compare() returns 0
+// Even if equals() returns false
+
+// Production impact: sorting by just one field can silently drop duplicates
+TreeSet<Employee> byName = new TreeSet<>(Comparator.comparing(Employee::getName));
+// If two employees have same name, only ONE is kept!
+```
+
+**Fix:** Use a tiebreaker in the comparator:
+```java
+TreeSet<Employee> safe = new TreeSet<>(
+    Comparator.comparing(Employee::getName)
+              .thenComparing(Employee::getId) // Ensures uniqueness
+);
+```
 
 ### Enterprise Usage
 ```java
@@ -1588,6 +1941,36 @@ public List<Product> getTopNExpensiveProducts(List<Product> products, int n) {
 }
 ```
 
+### Deep Theory: PriorityQueue is NOT Sorted
+
+A common misconception: PriorityQueue does NOT maintain elements in sorted order. Only the HEAD is guaranteed to be the minimum:
+
+```java
+PriorityQueue<Integer> pq = new PriorityQueue<>();
+pq.addAll(List.of(5, 1, 3, 4, 2));
+
+// Internal array might be: [1, 2, 3, 5, 4] -- NOT sorted!
+// Only pq.peek() = 1 is guaranteed to be minimum
+
+// To get sorted output, you MUST drain the queue:
+while (!pq.isEmpty()) {
+    System.out.print(pq.poll() + " "); // 1 2 3 4 5 (sorted!)
+}
+
+// Common mistake: iterating PriorityQueue directly
+for (int x : pq) { ... } // NOT in sorted order!
+```
+
+**Production Tip:** Use PriorityQueue when you only need the min/max element repeatedly (scheduling, top-N). If you need all elements sorted, use `TreeSet` or sort a `List`.
+
+### Interview Questions for Queue/Deque Implementations
+
+**Q: What is the time complexity of PriorityQueue.remove(Object)?**
+A: O(n). It performs a linear search to find the element, then O(log n) sift operation. Unlike `poll()` which is O(log n) because it always removes the head.
+
+**Q: Why does ArrayDeque use a power-of-2 array size?**
+A: To enable bitwise AND for index wrapping: `index & (length - 1)` instead of `index % length`. Bitwise AND is ~10x faster than modulo on most CPUs.
+
 ---
 
 ## 5.2 ArrayDeque
@@ -1744,6 +2127,27 @@ public class InMemoryCacheService<K, V> {
 }
 ```
 
+### Deep Theory: HashMap Initial Capacity Calculation
+
+```java
+// The CORRECT formula to avoid ANY resizing:
+int expectedSize = 1000;
+int capacity = (int)(expectedSize / 0.75f) + 1; // = 1334
+Map<K,V> map = new HashMap<>(capacity);
+
+// But HashMap rounds UP to the nearest power of 2:
+// 1334 -> 2048 (next power of 2)
+// So you get capacity=2048, threshold=1536, which comfortably holds 1000
+
+// Java 19+ provides a convenience method:
+Map<K,V> map = HashMap.newHashMap(expectedSize); // Does the math for you
+
+// WRONG: Common mistake
+Map<K,V> map = new HashMap<>(1000); // Threshold = 750, resizes at 750 entries!
+```
+
+**Production Impact:** A HashMap created to hold 10,000 entries with default capacity will resize 10 times (16->32->...->16384). Each resize rehashes ALL entries. Pre-sizing eliminates this completely.
+
 ---
 
 ## 6.2 LinkedHashMap
@@ -1798,6 +2202,23 @@ public class SessionCacheService {
     }
 }
 ```
+
+### Deep Theory: Access-Order LinkedHashMap for Production LRU Caches
+
+```
+Key insight: removeEldestEntry() is called AFTER every put() operation.
+
+Flow when accessOrder=true and maxSize=3:
+
+put(A)  -> [A]           removeEldestEntry? size=1 <= 3, no
+put(B)  -> [A, B]        removeEldestEntry? size=2 <= 3, no
+put(C)  -> [A, B, C]     removeEldestEntry? size=3 <= 3, no
+get(A)  -> [B, C, A]     A moves to tail (most recently accessed)
+put(D)  -> [C, A, D]     removeEldestEntry? size=4 > 3, YES -> removes B (head)
+                          B was least recently accessed
+```
+
+**Thread Safety Warning:** LinkedHashMap is NOT thread-safe. Always wrap with `Collections.synchronizedMap()` or use `ConcurrentHashMap` with manual LRU tracking.
 
 ---
 
@@ -1931,6 +2352,45 @@ public class MetricsService {
     }
 }
 ```
+
+### Deep Theory: ConcurrentHashMap Cooperative Resize (Transfer)
+
+```
+When ConcurrentHashMap needs to resize:
+
+1. Thread A triggers resize, creates new table (2x capacity)
+2. Thread A sets transferIndex = old table length
+3. Thread A starts migrating bins from right to left
+
+4. Thread B tries to put() into a bin being migrated
+5. Thread B sees ForwardingNode marker in old table
+6. Thread B HELPS with migration (steals a chunk of bins)
+
+7. Thread C tries to get() from a migrated bin
+8. Thread C follows ForwardingNode to new table (no blocking!)
+
+Result: Resize is parallelized across multiple threads.
+Reads NEVER block during resize.
+```
+
+**Why ConcurrentHashMap forbids null keys/values:**
+```java
+// With null values, you can't distinguish between:
+map.get("key") == null  // Does key not exist? Or is value null?
+
+// HashMap solves this with containsKey(), but ConcurrentHashMap can't:
+// Between containsKey() and get(), another thread might modify the map
+// This race condition is unsolvable with null values
+// So ConcurrentHashMap simply forbids them
+```
+
+### Interview Questions for Map Implementations
+
+**Q: Why is HashMap capacity always a power of 2?**
+A: So that `hash & (capacity - 1)` can be used instead of `hash % capacity`. Bitwise AND is a single CPU instruction, while modulo requires division -- about 20x slower. Power-of-2 ensures `capacity - 1` produces a bitmask (e.g., 15 = 0000 1111).
+
+**Q: A HashMap with 10M entries is taking 800MB of memory. How do you optimize?**
+A: 1) Pre-size to avoid resize copies. 2) Use primitive-specialized maps (Eclipse Collections IntObjectHashMap). 3) Use DTO/record keys instead of complex objects. 4) Consider off-heap storage (Chronicle Map). 5) Use WeakHashMap if entries can be GC'd. 6) Evaluate if all 10M entries need to be in memory.
 
 ---
 
@@ -2202,6 +2662,33 @@ static final int hash(Object key) {
 }
 ```
 
+### Deep Theory: HashMap Java 7 Infinite Loop Bug
+
+In Java 7, HashMap used **head insertion** during resize. Under concurrent access, this could create a circular linked list:
+
+```
+Before resize: bucket[5] -> A -> B -> null
+
+Thread 1 starts resize:     Thread 2 starts resize:
+  Reads A.next = B            Reads A.next = B
+  Inserts B at head           Inserts B at head  
+  Then inserts A at head      Then inserts A at head
+  
+Result: A.next = B, B.next = A  -- INFINITE LOOP!
+
+Any subsequent get() that hits this bucket hangs the CPU at 100%.
+```
+
+**Java 8 fix:** Uses **tail insertion** -- new entries are appended to the end of the chain. This maintains order and prevents circular references. However, HashMap is still NOT thread-safe. Always use ConcurrentHashMap for concurrent access.
+
+### Interview Questions for HashMap/TreeMap Internals
+
+**Q: Walk through what happens internally when you call `map.get("hello")` on a HashMap with 1 million entries.**
+A: 1) Compute hash: `"hello".hashCode() ^ (hashCode >>> 16)`. 2) Find bucket: `hash & (table.length - 1)`. 3) If bucket is empty, return null. 4) If first node's key matches (by hash AND equals), return its value. 5) If first node is TreeNode, search the Red-Black tree in O(log n). 6) Otherwise, traverse the linked list comparing each node. Total: O(1) average, O(log n) worst case.
+
+**Q: How does ConcurrentHashMap.size() work without locking?**
+A: It uses a `baseCount` field updated via CAS plus a `CounterCell[]` array (similar to `LongAdder`). Under contention, each thread increments its own CounterCell, avoiding a bottleneck. `size()` sums `baseCount + all CounterCells`. This is an eventually-consistent count.
+
 ---
 
 # Chapter 8: TreeMap, LinkedHashMap, and ConcurrentHashMap Internals
@@ -2460,6 +2947,57 @@ Need auto-cleanup of unused keys?   -> WeakHashMap
 | Null elements | No | No | Yes |
 | Memory | Array-based | Array-based | Node-based |
 
+### Deep Theory: The Collection Selection Decision Matrix
+
+```
+Step 1: Do you need key-value pairs?
+  YES --> Map family
+    Need sorted keys? --> TreeMap
+    Need insertion order? --> LinkedHashMap
+    Need thread safety? --> ConcurrentHashMap
+    Otherwise --> HashMap
+  NO --> Collection family
+
+Step 2: Do you need uniqueness?
+  YES --> Set family
+    Need sorted? --> TreeSet
+    Need insertion order? --> LinkedHashSet
+    Need enum type? --> EnumSet
+    Otherwise --> HashSet
+  NO --> Continue
+
+Step 3: Do you need FIFO/priority processing?
+  YES --> Queue/Deque family
+    Need priority ordering? --> PriorityQueue
+    Need blocking? --> ArrayBlockingQueue / LinkedBlockingQueue
+    Need stack (LIFO)? --> ArrayDeque
+    Need double-ended? --> ArrayDeque
+  NO --> List family
+    Default choice --> ArrayList
+    Need thread-safe reads? --> CopyOnWriteArrayList
+```
+
+### Real-World Timing: How Fast Are Collections Actually?
+
+```
+Benchmark on modern hardware (JMH, Java 17, 1M elements):
+
+ArrayList.get(i):        ~3 ns     (direct array access)
+HashMap.get(key):        ~8 ns     (hash + equals)
+TreeMap.get(key):       ~40 ns     (tree traversal)
+LinkedList.get(i):     ~500 us     (traverse from end, 500,000 ns for middle)
+
+ArrayList.add(end):      ~5 ns     (amortized)
+HashMap.put(k,v):       ~12 ns     (hash + insert)
+TreeMap.put(k,v):       ~50 ns     (tree insert + rebalance)
+
+HashSet.contains(o):     ~8 ns     (same as HashMap.get)
+ArrayList.contains(o): ~2.5 ms     (linear scan of 1M elements)
+                                    312,500x SLOWER than HashSet!
+```
+
+**Critical Lesson:** The single most impactful optimization in Java code is replacing `list.contains()` with `set.contains()` inside a loop. This turns O(n^2) into O(n).
+
 ---
 
 # Chapter 10: Real-Time Enterprise Usage Scenarios
@@ -2695,6 +3233,32 @@ public class BatchExportService {
             ));
     }
 }
+```
+
+### Deep Theory: Thread Safety Decision for Collections
+
+```
+Scenario                          Best Collection Choice
+---------                         ---------------------
+Read-only after initialization    Collections.unmodifiableXxx() or List.of()
+Single writer, many readers       CopyOnWriteArrayList / CopyOnWriteArraySet
+Many writers, many readers (Map)  ConcurrentHashMap
+Bounded producer-consumer         ArrayBlockingQueue
+Unbounded producer-consumer       ConcurrentLinkedQueue
+Priority-based processing         PriorityBlockingQueue
+Sorted concurrent map             ConcurrentSkipListMap
+General purpose (single thread)   ArrayList, HashMap, HashSet
+```
+
+**Anti-Pattern: Double-Checked Locking on Collections**
+```java
+// WRONG: Race condition between check and put
+if (!map.containsKey(key)) {
+    map.put(key, computeValue(key));
+}
+
+// RIGHT: Atomic operation
+map.computeIfAbsent(key, k -> computeValue(k));
 ```
 
 ---
@@ -3246,6 +3810,28 @@ public abstract class AbstractList<E> extends AbstractCollection<E> {
     }
 }
 ```
+
+### Deep Theory: Design Patterns Summary Table
+
+| Pattern | JCF Implementation | Purpose |
+|---|---|---|
+| **Iterator** | `Iterator`, `ListIterator`, `Spliterator` | Traverse without exposing internals |
+| **Factory** | `List.of()`, `Collections.emptyList()` | Hide implementation classes |
+| **Strategy** | `Comparator` in `sort()`, `TreeSet`, `TreeMap` | Pluggable comparison algorithms |
+| **Adapter** | `Arrays.asList()`, `Map.keySet()` | Convert between interfaces |
+| **Decorator** | `unmodifiableList()`, `synchronizedList()` | Add behavior (read-only, thread-safe) |
+| **Template Method** | `AbstractList`, `AbstractMap` | Skeleton + customizable steps |
+| **Null Object** | `Collections.emptyList()`, `Collections.emptyMap()` | Safe empty returns instead of null |
+
+**Architect Insight:** The largest design lesson from JCF is "program to the interface". Every method signature should accept `List`, `Set`, `Map` -- never `ArrayList`, `HashSet`, `HashMap`. This allows swapping implementations without changing client code.
+
+### Interview Questions for Chapters 12-13
+
+**Q: What is the difference between stream().forEach() and collection.forEach()?**
+A: `collection.forEach()` iterates directly and may be slightly faster (no stream pipeline overhead). `stream().forEach()` creates a stream pipeline with potential lazy evaluation. `parallelStream().forEach()` order is non-deterministic. For side effects, use `collection.forEach()`. For transformation chains, use streams.
+
+**Q: Name three design patterns used in the Collections Framework and give examples.**
+A: 1) **Iterator** -- `list.iterator()` decouples traversal from data structure. 2) **Decorator** -- `Collections.unmodifiableList()` wraps a list to add read-only behavior. 3) **Strategy** -- `Comparator` passed to `TreeSet`, `Collections.sort()` for pluggable ordering.
 
 ---
 
@@ -4393,6 +4979,170 @@ public static <T extends Comparable<T>> List<T> flattenDedupSort(List<List<T>> n
         .stream()
         .collect(Collectors.toList());
 }
+```
+
+---
+
+# Scenario-Based Debugging Questions (Production-Grade)
+
+These questions test your ability to diagnose and fix real-world problems. Interviewers at senior/architect level expect production experience.
+
+---
+
+**Scenario 1: The Memory Leak**
+
+Your Spring Boot application's heap usage grows by 200MB/hour until OOM. Thread dumps show no deadlocks. Heap dump analysis reveals a `HashMap<String, UserSession>` with 5 million entries.
+
+**What happened?**
+The session cache never evicts entries. Users log in and create sessions, but sessions are never removed after logout or expiry.
+
+**How to fix?**
+1) Use `LinkedHashMap` with `removeEldestEntry()` to cap size
+2) Add `@Scheduled` cleanup to remove expired entries
+3) Use `WeakHashMap` if sessions should be GC'd when no longer referenced
+4) Best: Use Caffeine cache with TTL: `Caffeine.newBuilder().expireAfterWrite(30, MINUTES).maximumSize(10_000).build()`
+
+---
+
+**Scenario 2: The Silent Data Corruption**
+
+Your API returns correct data 99% of the time but occasionally returns wrong results for a specific user. The bug is intermittent and only appears under load.
+
+**What happened?**
+A `HashMap` is used as a cache in a singleton `@Service` bean. Multiple threads modify it concurrently. Under concurrent resize, entries can end up in wrong buckets or be lost entirely.
+
+**How to fix?**
+Replace `HashMap` with `ConcurrentHashMap`. The bug disappears because ConcurrentHashMap uses per-bin locking and CAS operations.
+
+---
+
+**Scenario 3: The O(n^2) API**
+
+An API endpoint that returns filtered orders takes 200ms with 100 orders but 30 seconds with 10,000 orders. The code:
+```java
+List<Order> filtered = new ArrayList<>();
+for (Order order : allOrders) {
+    if (excludedIds.contains(order.getId())) continue; // excludedIds is a List!
+    filtered.add(order);
+}
+```
+
+**What happened?**
+`excludedIds` is an `ArrayList`. `contains()` is O(n), called inside a loop = O(n^2).
+
+**How to fix?**
+```java
+Set<String> excludedSet = new HashSet<>(excludedIds); // O(n) once
+for (Order order : allOrders) {
+    if (excludedSet.contains(order.getId())) continue; // O(1) per check
+    filtered.add(order);
+}
+```
+
+---
+
+**Scenario 4: The Phantom Duplicates**
+
+Your `HashSet<Employee>` contains duplicate employees with the same `id`. The `equals()` method is correctly overridden.
+
+**What happened?**
+`hashCode()` is NOT overridden. Two employees with the same `id` have different default `hashCode()` values (based on memory address), so they end up in different buckets. `equals()` is never even called.
+
+**How to fix?**
+Always override BOTH `equals()` and `hashCode()`. Use `@EqualsAndHashCode` (Lombok) or `record` (Java 16+).
+
+---
+
+**Scenario 5: The ConcurrentModificationException in Production**
+
+Logs show `ConcurrentModificationException` at `ArrayList.Itr.checkForComodification`. The stack trace points to a `@Scheduled` method that iterates over a list and removes expired entries.
+
+**What happened?**
+The `@Scheduled` method runs on a scheduled thread while HTTP request threads also modify the same ArrayList.
+
+**How to fix?**
+Option A: Use `CopyOnWriteArrayList` (if reads >> writes)
+Option B: Use `list.removeIf(Entry::isExpired)` (atomic within single thread)
+Option C: Use `ConcurrentLinkedQueue` if ordering doesn't matter
+
+---
+
+**Scenario 6: The Infinite Loop**
+
+Your Java 7 application hangs (CPU 100%) periodically under high load. Thread dumps show threads stuck in `HashMap.get()` -> `HashMap$Entry.next`.
+
+**What happened?**
+Java 7 HashMap uses head insertion during resize. Two threads simultaneously trigger resize, creating a circular linked list in a bucket. Any `get()` hitting that bucket loops forever.
+
+**How to fix?**
+1) Upgrade to Java 8+ (uses tail insertion, no circular reference)
+2) Replace `HashMap` with `ConcurrentHashMap`
+3) Never use HashMap from multiple threads without synchronization
+
+---
+
+**Scenario 7: The TreeMap ClassCastException**
+
+Your `TreeMap<Object, String>` works for months, then suddenly throws `ClassCastException: String cannot be cast to Integer`.
+
+**What happened?**
+The TreeMap uses natural ordering (`Comparable`). When the first entry was a `String`, all subsequent entries must also be `String`. Adding an `Integer` fails because `String.compareTo(Integer)` cannot work.
+
+**How to fix?**
+Use generics properly: `TreeMap<String, String>`. TreeMap without generics is a ticking time bomb. Always specify key and value types.
+
+---
+
+**Scenario 8: The Stale Cache**
+
+Your `ConcurrentHashMap` cache returns outdated data. The data was updated in the database 10 minutes ago, but the cache still shows old values.
+
+**What happened?**
+ConcurrentHashMap is not a cache -- it has no TTL, no eviction, no refresh. Once you `put()` a value, it stays forever until explicitly removed.
+
+**How to fix?**
+```java
+// Option A: Scheduled eviction
+@Scheduled(fixedRate = 300_000)
+public void evictCache() { cache.clear(); }
+
+// Option B: Use a proper cache
+LoadingCache<String, Product> cache = Caffeine.newBuilder()
+    .expireAfterWrite(5, TimeUnit.MINUTES)
+    .maximumSize(1_000)
+    .build(key -> productRepository.findById(key));
+```
+
+---
+
+**Scenario 9: The UnsupportedOperationException**
+
+Your REST controller returns `List.of(dto1, dto2)`. The downstream service that receives this list tries to sort it and crashes with `UnsupportedOperationException`.
+
+**What happened?**
+`List.of()` returns an immutable list. `sort()` modifies the list in-place, which is not allowed.
+
+**How to fix?**
+Return `new ArrayList<>(List.of(dto1, dto2))` or use `List.copyOf()` only when you guarantee no mutation. Document in API contract whether returned lists are mutable.
+
+---
+
+**Scenario 10: The PriorityQueue Surprise**
+
+Your task scheduler uses `PriorityQueue<Task>` ordered by priority. When you iterate over the queue to display pending tasks, they appear in random order.
+
+**What happened?**
+PriorityQueue does NOT maintain sorted order internally. It only guarantees that `peek()` returns the minimum. The internal array is a min-heap, not a sorted array.
+
+**How to fix?**
+```java
+// For display: drain into sorted list
+List<Task> sorted = new ArrayList<>(priorityQueue);
+sorted.sort(Comparator.comparing(Task::getPriority));
+
+// Or use TreeSet if you need both iteration order and uniqueness
+NavigableSet<Task> tasks = new TreeSet<>(Comparator.comparing(Task::getPriority)
+    .thenComparing(Task::getId));
 ```
 
 ---

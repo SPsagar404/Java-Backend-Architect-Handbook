@@ -1308,6 +1308,12 @@ A: No, not by default. Hibernate can't determine if the related entity exists wi
 
 # Part 7: Fetching Strategies
 
+### Deep Theory: Why Fetching Strategy is the #1 Performance Decision
+
+Every Hibernate performance problem in production traces back to incorrect fetching. Loading too much data (EAGER) wastes memory and bandwidth. Loading too little (LAZY without planning) causes the N+1 problem. The architect's job is to choose the right strategy for each use case.
+
+**Architect's Rule:** Define entity associations as LAZY, then selectively fetch eagerly per-query using JOIN FETCH or @EntityGraph. NEVER use `FetchType.EAGER` on the entity definition.
+
 ## 7.1 Lazy vs Eager Loading
 
 ### Lazy Loading (Default for Collections)
@@ -1318,6 +1324,25 @@ private List<Order> orders;
 // SELECT * FROM customers WHERE id = ?
 // ... later when customer.getOrders() is called:
 // SELECT * FROM orders WHERE customer_id = ?
+```
+
+### How Lazy Loading Works Internally
+
+When you define a LAZY association, Hibernate doesn't load the data. Instead, it creates a **proxy object** (or PersistentCollection for collections). The proxy looks like a real object but contains no data. When you call a method on it (e.g., `orders.size()`), Hibernate intercepts the call, executes the SELECT, and populates the data.
+
+```
+customer.getOrders() returns:
+  PersistentBag (Hibernate proxy collection)
+  |-- initialized = false
+  |-- session = Session@xyz (reference to current session)
+  
+customer.getOrders().size() triggers:
+  1. Proxy detects it's not initialized
+  2. Checks if Session is still open (if NOT -> LazyInitializationException!)
+  3. Executes: SELECT * FROM orders WHERE customer_id = ?
+  4. Populates the collection
+  5. Sets initialized = true
+  6. Returns actual size
 ```
 
 ### Eager Loading
@@ -1343,6 +1368,15 @@ private Customer customer;
 
 The most common Hibernate performance problem in production.
 
+### Root Cause Analysis
+
+The N+1 problem occurs when:
+1. You load a list of parent entities (1 query)
+2. For each parent, Hibernate lazily loads a child collection (N queries)
+3. Total: 1 + N queries
+
+**Why it's dangerous:** With 100 customers, you get 101 queries. With 10,000 customers, you get 10,001 queries. Each query has network round-trip overhead (1-5ms). 10,001 queries x 2ms = 20 seconds just in network latency!
+
 ```java
 // N+1 Problem Example:
 List<Customer> customers = customerRepository.findAll();
@@ -1365,6 +1399,16 @@ List<Customer> findAllWithOrders();
 // Single query: SELECT c.*, o.* FROM customers c JOIN orders o ON ...
 ```
 
+**Warning -- Cartesian Product Problem:** If you JOIN FETCH two collections simultaneously, you get a Cartesian product. Customer with 5 orders and 3 addresses = 15 result rows per customer!
+
+```java
+// BAD: Cartesian product (MultipleBagFetchException with Lists)
+@Query("SELECT c FROM Customer c JOIN FETCH c.orders JOIN FETCH c.addresses")
+List<Customer> findAllWithOrdersAndAddresses(); // EXCEPTION!
+
+// Fix: Use Set instead of List for one collection, OR fetch in separate queries
+```
+
 ### Solution 2: @EntityGraph
 ```java
 @EntityGraph(attributePaths = {"orders"})
@@ -1383,9 +1427,47 @@ private List<Order> orders;
 // ...
 ```
 
+**When to use @BatchSize:** When you can't use JOIN FETCH (e.g., pagination with JOIN FETCH fails because Hibernate applies LIMIT in-memory). @BatchSize works correctly with pagination.
+
+### How to Detect N+1 in Production
+
+```yaml
+# Enable Hibernate statistics
+spring:
+  jpa:
+    properties:
+      hibernate:
+        generate_statistics: true
+# Check logs for:
+# Session Metrics { 101 JDBC statements prepared }
+# If statement count is much higher than expected, you have N+1!
+```
+
+### Interview Questions for Part 7
+
+**Q: What causes the N+1 problem?**
+A: Loading N parent entities in one query, then lazily loading a child collection for each parent triggers N additional queries. Total = 1 + N. Fix with JOIN FETCH, @EntityGraph, or @BatchSize.
+
+**Q: Why can't you use JOIN FETCH with pagination?**
+A: When you JOIN FETCH a collection and use Pageable, Hibernate can't apply SQL LIMIT/OFFSET correctly (each parent has multiple rows from the JOIN). Hibernate falls back to in-memory pagination, loading ALL data first. Use @BatchSize or DTO projections instead.
+
 ---
 
 # Part 8: Hibernate Query Methods
+
+### Deep Theory: How Hibernate Translates Queries
+
+Hibernate provides three query languages. Understanding when to use each and what SQL they generate is crucial:
+
+```
+JPQL/HQL Query String
+   |  (parsed by Hibernate Query Parser / SQM in Hibernate 6)
+   v
+SQL Abstract Syntax Tree (AST)
+   |  (Dialect applies DB-specific rules)
+   v
+Native SQL String -> JDBC PreparedStatement -> Database
+```
 
 ## 8.1 HQL (Hibernate Query Language)
 
@@ -1407,6 +1489,19 @@ int updated = session.createQuery(
     .executeUpdate();
 ```
 
+### Production Tip: Bulk UPDATE Bypasses Persistence Context
+
+When you use HQL/JPQL `UPDATE` or `DELETE`, Hibernate executes SQL directly without updating the persistence context. Entities in memory become stale!
+
+```java
+@Transactional
+public void deactivateUsers() {
+    entityManager.createQuery("UPDATE User u SET u.status = 'INACTIVE' WHERE ...")
+        .executeUpdate();
+    entityManager.clear(); // CRITICAL! Without this, cached entities still show old status
+}
+```
+
 ## 8.2 JPQL (Java Persistence Query Language)
 
 ```java
@@ -1426,6 +1521,15 @@ List<UserSummaryDTO> findUserSummaries(@Param("status") UserStatus status);
 List<Object[]> getDepartmentStats();
 ```
 
+### Best Practice: Use DTO Projections for Read-Only Queries
+
+Loading full entities for display-only purposes wastes resources:
+- Loads ALL columns (including large TEXT/BLOB fields)
+- Creates entity snapshots (memory overhead for dirty checking)
+- Loads EAGER associations unnecessarily
+
+DTO projections skip ALL of this overhead.
+
 ## 8.3 Native SQL
 
 ```java
@@ -1443,6 +1547,16 @@ List<User> findRecentByEmailDomain(String domain);
 List<Object[]> getUserOrderCounts();
 ```
 
+### When to Use Native SQL in Production
+
+| Use Case | Why Native SQL |
+|---|---|
+| Window functions | `ROW_NUMBER() OVER(PARTITION BY ...)` not supported in JPQL |
+| Common Table Expressions (CTEs) | `WITH ... AS (...)` not in JPQL |
+| Full-text search | PostgreSQL `tsvector`, MySQL `MATCH AGAINST` |
+| Database-specific JSON | PostgreSQL `jsonb_extract_path_text` |
+| Performance-critical queries | Hand-optimized SQL with query hints |
+
 ## 8.4 Comparison
 
 | Feature | HQL | JPQL | Native SQL |
@@ -1453,5 +1567,13 @@ List<Object[]> getUserOrderCounts();
 | **DB functions** | Some | Limited | Full support |
 | **Complex queries** | Good | Good | Best |
 | **Use when** | Hibernate features needed | Default choice | Complex/optimized SQL |
+
+### Interview Questions for Part 8
+
+**Q: What is the difference between HQL and JPQL?**
+A: HQL is Hibernate-specific and supports Hibernate extensions. JPQL is the JPA standard, portable across JPA providers. In practice, most developers use JPQL via `@Query` in Spring Data repositories.
+
+**Q: Why do bulk HQL UPDATE/DELETE statements cause stale data?**
+A: Because they execute SQL directly, bypassing the persistence context. Entities cached in the first-level cache still reflect old state. Fix: call `entityManager.clear()` or use `@Modifying(clearAutomatically = true)`.
 
 ---

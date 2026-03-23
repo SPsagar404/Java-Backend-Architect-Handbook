@@ -838,6 +838,170 @@ public static <T extends Comparable<T>> List<T> flattenDedupSort(List<List<T>> n
 
 ---
 
+# Scenario-Based Debugging Questions (Production-Grade)
+
+These questions test your ability to diagnose and fix real-world problems. Interviewers at senior/architect level expect production experience.
+
+---
+
+**Scenario 1: The Memory Leak**
+
+Your Spring Boot application's heap usage grows by 200MB/hour until OOM. Thread dumps show no deadlocks. Heap dump analysis reveals a `HashMap<String, UserSession>` with 5 million entries.
+
+**What happened?**
+The session cache never evicts entries. Users log in and create sessions, but sessions are never removed after logout or expiry.
+
+**How to fix?**
+1) Use `LinkedHashMap` with `removeEldestEntry()` to cap size
+2) Add `@Scheduled` cleanup to remove expired entries
+3) Use `WeakHashMap` if sessions should be GC'd when no longer referenced
+4) Best: Use Caffeine cache with TTL: `Caffeine.newBuilder().expireAfterWrite(30, MINUTES).maximumSize(10_000).build()`
+
+---
+
+**Scenario 2: The Silent Data Corruption**
+
+Your API returns correct data 99% of the time but occasionally returns wrong results for a specific user. The bug is intermittent and only appears under load.
+
+**What happened?**
+A `HashMap` is used as a cache in a singleton `@Service` bean. Multiple threads modify it concurrently. Under concurrent resize, entries can end up in wrong buckets or be lost entirely.
+
+**How to fix?**
+Replace `HashMap` with `ConcurrentHashMap`. The bug disappears because ConcurrentHashMap uses per-bin locking and CAS operations.
+
+---
+
+**Scenario 3: The O(n^2) API**
+
+An API endpoint that returns filtered orders takes 200ms with 100 orders but 30 seconds with 10,000 orders. The code:
+```java
+List<Order> filtered = new ArrayList<>();
+for (Order order : allOrders) {
+    if (excludedIds.contains(order.getId())) continue; // excludedIds is a List!
+    filtered.add(order);
+}
+```
+
+**What happened?**
+`excludedIds` is an `ArrayList`. `contains()` is O(n), called inside a loop = O(n^2).
+
+**How to fix?**
+```java
+Set<String> excludedSet = new HashSet<>(excludedIds); // O(n) once
+for (Order order : allOrders) {
+    if (excludedSet.contains(order.getId())) continue; // O(1) per check
+    filtered.add(order);
+}
+```
+
+---
+
+**Scenario 4: The Phantom Duplicates**
+
+Your `HashSet<Employee>` contains duplicate employees with the same `id`. The `equals()` method is correctly overridden.
+
+**What happened?**
+`hashCode()` is NOT overridden. Two employees with the same `id` have different default `hashCode()` values (based on memory address), so they end up in different buckets. `equals()` is never even called.
+
+**How to fix?**
+Always override BOTH `equals()` and `hashCode()`. Use `@EqualsAndHashCode` (Lombok) or `record` (Java 16+).
+
+---
+
+**Scenario 5: The ConcurrentModificationException in Production**
+
+Logs show `ConcurrentModificationException` at `ArrayList.Itr.checkForComodification`. The stack trace points to a `@Scheduled` method that iterates over a list and removes expired entries.
+
+**What happened?**
+The `@Scheduled` method runs on a scheduled thread while HTTP request threads also modify the same ArrayList.
+
+**How to fix?**
+Option A: Use `CopyOnWriteArrayList` (if reads >> writes)
+Option B: Use `list.removeIf(Entry::isExpired)` (atomic within single thread)
+Option C: Use `ConcurrentLinkedQueue` if ordering doesn't matter
+
+---
+
+**Scenario 6: The Infinite Loop**
+
+Your Java 7 application hangs (CPU 100%) periodically under high load. Thread dumps show threads stuck in `HashMap.get()` -> `HashMap$Entry.next`.
+
+**What happened?**
+Java 7 HashMap uses head insertion during resize. Two threads simultaneously trigger resize, creating a circular linked list in a bucket. Any `get()` hitting that bucket loops forever.
+
+**How to fix?**
+1) Upgrade to Java 8+ (uses tail insertion, no circular reference)
+2) Replace `HashMap` with `ConcurrentHashMap`
+3) Never use HashMap from multiple threads without synchronization
+
+---
+
+**Scenario 7: The TreeMap ClassCastException**
+
+Your `TreeMap<Object, String>` works for months, then suddenly throws `ClassCastException: String cannot be cast to Integer`.
+
+**What happened?**
+The TreeMap uses natural ordering (`Comparable`). When the first entry was a `String`, all subsequent entries must also be `String`. Adding an `Integer` fails because `String.compareTo(Integer)` cannot work.
+
+**How to fix?**
+Use generics properly: `TreeMap<String, String>`. TreeMap without generics is a ticking time bomb. Always specify key and value types.
+
+---
+
+**Scenario 8: The Stale Cache**
+
+Your `ConcurrentHashMap` cache returns outdated data. The data was updated in the database 10 minutes ago, but the cache still shows old values.
+
+**What happened?**
+ConcurrentHashMap is not a cache -- it has no TTL, no eviction, no refresh. Once you `put()` a value, it stays forever until explicitly removed.
+
+**How to fix?**
+```java
+// Option A: Scheduled eviction
+@Scheduled(fixedRate = 300_000)
+public void evictCache() { cache.clear(); }
+
+// Option B: Use a proper cache
+LoadingCache<String, Product> cache = Caffeine.newBuilder()
+    .expireAfterWrite(5, TimeUnit.MINUTES)
+    .maximumSize(1_000)
+    .build(key -> productRepository.findById(key));
+```
+
+---
+
+**Scenario 9: The UnsupportedOperationException**
+
+Your REST controller returns `List.of(dto1, dto2)`. The downstream service that receives this list tries to sort it and crashes with `UnsupportedOperationException`.
+
+**What happened?**
+`List.of()` returns an immutable list. `sort()` modifies the list in-place, which is not allowed.
+
+**How to fix?**
+Return `new ArrayList<>(List.of(dto1, dto2))` or use `List.copyOf()` only when you guarantee no mutation. Document in API contract whether returned lists are mutable.
+
+---
+
+**Scenario 10: The PriorityQueue Surprise**
+
+Your task scheduler uses `PriorityQueue<Task>` ordered by priority. When you iterate over the queue to display pending tasks, they appear in random order.
+
+**What happened?**
+PriorityQueue does NOT maintain sorted order internally. It only guarantees that `peek()` returns the minimum. The internal array is a min-heap, not a sorted array.
+
+**How to fix?**
+```java
+// For display: drain into sorted list
+List<Task> sorted = new ArrayList<>(priorityQueue);
+sorted.sort(Comparator.comparing(Task::getPriority));
+
+// Or use TreeSet if you need both iteration order and uniqueness
+NavigableSet<Task> tasks = new TreeSet<>(Comparator.comparing(Task::getPriority)
+    .thenComparing(Task::getId));
+```
+
+---
+
 # Appendix: Quick Reference Cheat Sheet
 
 ## Choosing the Right Collection
